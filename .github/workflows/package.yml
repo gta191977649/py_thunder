@@ -1,0 +1,47 @@
+name: package-pythunder
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    name: Build on ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - windows-latest
+          - macos-latest
+          - ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements-build.txt
+
+      - name: Ensure aria2 is executable
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          if [ -f resources/aria2/mac/aria2c ]; then chmod +x resources/aria2/mac/aria2c; fi
+          if [ -f resources/aria2/linux/aria2c ]; then chmod +x resources/aria2/linux/aria2c; fi
+
+      - name: Build portable package
+        run: python scripts/build_release.py --mode portable --clean
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: pythunder-${{ runner.os }}-portable
+          path: release/**
+          if-no-files-found: error

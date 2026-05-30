@@ -1,0 +1,254 @@
+QMainWindow,
+QWidget {
+    background-color: #e7edf6;
+    color: #1a1a1a;
+    font-family: "SimSun";
+    font-weight: normal;
+    font-size: 9pt;
+}
+
+QMenuBar {
+    background: #f4f4f0;
+    border-bottom: 1px solid #93a7c3;
+    spacing: 2px;
+    font-family: "SimSun";
+    font-weight: normal;
+}
+
+QMenuBar::item {
+    background: transparent;
+    padding: 3px 8px;
+}
+
+QMenuBar::item:selected {
+    background: #d7e6fa;
+    border: 1px solid #8ea2c0;
+}
+
+QMenu {
+    font-family: "SimSun";
+    font-weight: normal;
+}
+
+#bannerPanel {
+    border: 1px solid #6f8fb6;
+    background: qlineargradient(
+        x1:0, y1:0, x2:1, y2:0,
+        stop:0 #2b78c4,
+        stop:0.55 #5ebeff,
+        stop:1 #d9e7f6
+    );
+}
+
+#bannerMark {
+    background: qradialgradient(
+        cx:0.3, cy:0.3, radius:0.9,
+        fx:0.3, fy:0.3,
+        stop:0 #f8c665,
+        stop:0.55 #e28c22,
+        stop:1 #84440b
+    );
+    color: white;
+    border: 2px solid rgba(255, 255, 255, 0.75);
+    border-radius: 28px;
+    font-size: 24pt;
+    font-weight: bold;
+}
+
+#bannerBrand {
+    color: #ffffff;
+    font-size: 18pt;
+    font-weight: bold;
+    background: transparent;
+}
+
+#bannerSubtitle,
+#bannerSlogan,
+#bannerNote {
+    background: transparent;
+    color: #f7fbff;
+}
+
+#bannerSlogan {
+    font-size: 16pt;
+    font-weight: bold;
+    color: #ffffff;
+}
+
+#bannerNote {
+    padding: 6px 10px;
+    border: 1px solid rgba(255, 255, 255, 0.45);
+    background: rgba(255, 255, 255, 0.15);
+}
+
+#toolbarPanel {
+    background: qlineargradient(
+        x1:0, y1:0, x2:0, y2:1,
+        stop:0 #edf3fb,
+        stop:1 #cfdbeb
+    );
+    border: 1px solid #8ea4c1;
+}
+
+QToolButton#toolbarButton {
+    background: transparent;
+    border: 1px solid transparent;
+    padding: 2px 4px 1px 4px;
+    color: #2a2a2a;
+    font-family: "SimSun";
+    font-weight: normal;
+}
+
+QToolButton#toolbarButton:hover {
+    background: rgba(255, 255, 255, 0.55);
+    border: 1px solid #9ab1ce;
+}
+
+QToolButton#toolbarButton:pressed {
+    background: rgba(190, 212, 238, 0.75);
+    border: 1px solid #6f93bb;
+}
+
+QToolButton#toolbarButton:disabled {
+    color: #7a7a7a;
+}
+
+QFrame#panelFrame {
+    border: 1px solid #7f99bb;
+    background: #f7f7f3;
+}
+
+QLabel#panelTitle {
+    padding: 3px 8px;
+    background: qlineargradient(
+        x1:0, y1:0, x2:0, y2:1,
+        stop:0 #d8e6f8,
+        stop:1 #b6cde7
+    );
+    border-bottom: 1px solid #89a3c3;
+    font-weight: bold;
+    color: #243a5d;
+    font-family: "SimSun";
+}
+
+QSplitter#mainSplitter::handle,
+QSplitter#leftPaneSplitter::handle,
+QSplitter#rightPaneSplitter::handle {
+    background-color: #b8c7db;
+}
+
+QTreeWidget#taskSidebar {
+    background: #fbfbf7;
+    border: none;
+    outline: none;
+    padding: 4px;
+    font-family: "SimSun";
+    font-weight: normal;
+}
+
+QTreeWidget#taskSidebar::item {
+    height: 22px;
+    padding: 1px 2px;
+}
+
+QTreeWidget#taskSidebar::item:selected {
+    background: #d6e5f8;
+    color: #17355a;
+}
+
+QTableView#taskTable {
+    background: #ffffff;
+    border: none;
+    gridline-color: #cbd6e2;
+    selection-background-color: #2f702a;
+    selection-color: #ffffff;
+    alternate-background-color: #ffffff;
+    font-family: "SimSun";
+    font-weight: normal;
+}
+
+QTableView#taskTable::item {
+    padding: 0 4px;
+    border: none;
+}
+
+QTableView#taskTable::item:selected {
+    background: #2f702a;
+    color: #ffffff;
+}
+
+QHeaderView::section {
+    background: qlineargradient(
+        x1:0, y1:0, x2:0, y2:1,
+        stop:0 #f4f8fd,
+        stop:0.55 #d4e0ee,
+        stop:1 #bccdde
+    );
+    border: 1px solid #92a4bb;
+    padding: 3px 8px;
+    color: #21344e;
+    font-family: "SimSun";
+    font-weight: normal;
+}
+
+QPlainTextEdit#logView,
+QPlainTextEdit#threadLogView,
+QLabel#taskInfoBody {
+    background: #fffef8;
+    border: none;
+    padding: 8px;
+    color: #1f2b38;
+    font-family: "SimSun";
+    font-weight: normal;
+}
+
+QPlainTextEdit#logView {
+    selection-background-color: #d7e8f8;
+}
+
+QTabWidget#runtimeTabs::pane {
+    border: 1px solid #8ea4c1;
+    background: #fffef8;
+    top: -1px;
+}
+
+QTabWidget#runtimeTabs QTabBar::tab {
+    background: #f7f3de;
+    border: 1px solid #8fa4bf;
+    border-bottom: none;
+    padding: 3px 12px 2px 12px;
+    margin-right: 1px;
+    min-width: 52px;
+    font-family: "SimSun";
+    font-weight: normal;
+}
+
+QTabWidget#runtimeTabs QTabBar::tab:selected {
+    background: #fffef0;
+    color: #1f2e42;
+    margin-top: -1px;
+}
+
+QTabWidget#runtimeTabs QTabBar::tab:!selected {
+    background: #ece4c5;
+}
+
+QLineEdit,
+QPushButton,
+QDialogButtonBox QPushButton {
+    border: 1px solid #88a2bf;
+    background: #ffffff;
+    padding: 4px 8px;
+}
+
+QPushButton:hover,
+QDialogButtonBox QPushButton:hover {
+    background: #f2f7fd;
+}
+
+QStatusBar {
+    background: #ece8cf;
+    border-top: 1px solid #b2aa80;
+    font-family: "SimSun";
+    font-weight: normal;
+}

@@ -1,0 +1,58 @@
+# Python bytecode and caches
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+
+# Build and packaging outputs
+build/
+dist/
+release/
+*.spec
+
+# Test and tooling caches
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.pyre/
+.hypothesis/
+.coverage
+.coverage.*
+htmlcov/
+pip-wheel-metadata/
+
+# Packaging metadata
+*.egg-info/
+.eggs/
+
+# Logs and local runtime files
+*.log
+*.tmp
+*.bak
+
+# IDE and editor files
+.idea/
+.vscode/
+*.code-workspace
+
+# OS files
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Local Python version managers
+.python-version
+
+# Local environment files
+.env
+.env.*
+
+# Bundled third-party binaries should be supplied separately per platform
+resources/aria2/win/aria2c.exe
+resources/aria2/mac/aria2c
+resources/aria2/linux/aria2c
