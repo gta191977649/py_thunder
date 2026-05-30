@@ -301,10 +301,8 @@ class MainWindow(QMainWindow):
             menu_bar.addMenu(ThunderMenu(self.theme, self.ui_font, self.translator.t(key), menu_bar))
 
     def _install_shortcuts(self) -> None:
-        self.delete_shortcut = QShortcut(QKeySequence("Delete"), self)
-        self.delete_shortcut.activated.connect(self.remove_selected_task)
-        self.permanent_delete_shortcut = QShortcut(QKeySequence("Shift+Delete"), self)
-        self.permanent_delete_shortcut.activated.connect(
+        self.task_table.remove_requested.connect(self.remove_selected_task)
+        self.task_table.permanent_delete_requested.connect(
             self.permanently_delete_selected_task
         )
         self.select_all_shortcut = QShortcut(

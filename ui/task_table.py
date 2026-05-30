@@ -13,6 +13,7 @@ from PyQt6.QtCore import (
     QSize,
     QSignalBlocker,
     Qt,
+    pyqtSignal,
 )
 from PyQt6.QtGui import QColor, QIcon, QKeySequence, QLinearGradient, QPainter, QPen, QPolygon
 from PyQt6.QtWidgets import (
@@ -645,6 +646,9 @@ class TaskHeaderView(QHeaderView):
 
 
 class TaskTableView(QTableView):
+    remove_requested = pyqtSignal()
+    permanent_delete_requested = pyqtSignal()
+
     def __init__(self, model: TaskTableModel, theme: dict, parent=None) -> None:
         super().__init__(parent)
         self.theme = theme
@@ -787,6 +791,16 @@ class TaskTableView(QTableView):
             self.select_all_task_rows()
             event.accept()
             return
+        if event.key() == Qt.Key.Key_Delete:
+            modifiers = event.modifiers()
+            if modifiers == Qt.KeyboardModifier.ShiftModifier:
+                self.permanent_delete_requested.emit()
+                event.accept()
+                return
+            if modifiers == Qt.KeyboardModifier.NoModifier:
+                self.remove_requested.emit()
+                event.accept()
+                return
         super().keyPressEvent(event)
 
     def mousePressEvent(self, event) -> None:

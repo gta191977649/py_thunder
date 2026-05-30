@@ -1,4 +1,5 @@
 # PyThunder
+![PyThunder screenshot](doc/screenshot.png)
 
 PyThunder 是一个基于 `PyQt6 + aria2` 的跨平台桌面下载管理器项目，目标是复刻经典下载器的桌面交互体验，同时保持清晰、易扩展的 Python 架构。
 
