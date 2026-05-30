@@ -102,6 +102,39 @@ class OSIntegrationService:
         except OSError as exc:
             raise RuntimeError(str(exc)) from exc
 
+    def move_task_files(self, task: DownloadTask, destination_dir: str) -> Path:
+        target = self._resolve_task_target(task, require_exists=True)
+        if not target:
+            raise FileNotFoundError(task.name or task.save_path)
+
+        if not destination_dir:
+            raise ValueError("No destination folder was provided.")
+
+        destination_root = Path(destination_dir).expanduser()
+        destination_root.mkdir(parents=True, exist_ok=True)
+        destination = destination_root / target.name
+
+        try:
+            if destination.exists() and destination.resolve() != target.resolve():
+                raise FileExistsError(str(destination))
+        except OSError:
+            if destination.exists():
+                raise FileExistsError(str(destination))
+
+        if destination == target:
+            return destination
+
+        sidecar = Path(f"{target}.aria2")
+        destination_sidecar = destination_root / sidecar.name
+
+        try:
+            shutil.move(str(target), str(destination))
+            if sidecar.exists():
+                shutil.move(str(sidecar), str(destination_sidecar))
+        except OSError as exc:
+            raise RuntimeError(str(exc)) from exc
+        return destination
+
     def get_task_control_file_path(self, task: DownloadTask) -> Path | None:
         target = self._resolve_task_target(task, require_exists=False)
         if not target:

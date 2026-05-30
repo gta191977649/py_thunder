@@ -4,8 +4,17 @@ from dataclasses import dataclass
 from pathlib import Path
 from urllib.parse import urlparse
 
-from PyQt6.QtCore import QAbstractTableModel, QFileInfo, QModelIndex, QRect, QSize, Qt
-from PyQt6.QtGui import QColor, QIcon, QPainter, QPen
+from PyQt6.QtCore import (
+    QAbstractTableModel,
+    QFileInfo,
+    QModelIndex,
+    QPoint,
+    QRect,
+    QSize,
+    QSignalBlocker,
+    Qt,
+)
+from PyQt6.QtGui import QColor, QIcon, QKeySequence, QLinearGradient, QPainter, QPen, QPolygon
 from PyQt6.QtWidgets import (
     QFileIconProvider,
     QHeaderView,
@@ -66,6 +75,8 @@ class TaskTableModel(QAbstractTableModel):
         self._thread_rows_by_gid: dict[str, list[TaskConnectionRow]] = {}
         self._expanded_gids: set[str] = set()
         self._rows: list[TaskTableRow] = []
+        self._sort_column: int | None = None
+        self._sort_order = Qt.SortOrder.AscendingOrder
         self._file_icon_provider = QFileIconProvider()
         self._file_icons_by_type: dict[str, QIcon] = {}
         icons_dir = get_thunder5_icons_dir() / "task_status"
@@ -204,8 +215,68 @@ class TaskTableModel(QAbstractTableModel):
         }
         valid_task_gids = {task.gid for task in self._tasks}
         self._expanded_gids.intersection_update(valid_task_gids)
+        self._apply_task_sort()
         self._rebuild_rows()
         self.endResetModel()
+
+    def sort(
+        self,
+        column: int,
+        order: Qt.SortOrder = Qt.SortOrder.AscendingOrder,
+    ) -> None:
+        if not 0 <= column < self.columnCount():
+            return
+        self._sort_column = column
+        self._sort_order = order
+        self.beginResetModel()
+        self._apply_task_sort()
+        self._rebuild_rows()
+        self.endResetModel()
+
+    def _apply_task_sort(self) -> None:
+        if self._sort_column is None:
+            return
+
+        self._tasks.sort(key=lambda task: (task.created_at or "", task.gid), reverse=True)
+        self._tasks.sort(
+            key=lambda task: self._sort_value(task, self._sort_column or 0),
+            reverse=self._sort_order == Qt.SortOrder.DescendingOrder,
+        )
+
+    def _sort_value(self, task: DownloadTask, column: int):
+        if column == 0:
+            return self._status_sort_rank(task)
+        if column == 1:
+            return (task.name or "").casefold()
+        if column == 2:
+            return task.progress
+        if column == 3:
+            return int(task.download_speed or 0)
+        if column == 4:
+            return int(task.total_length or 0)
+        if column == 5:
+            remaining = max(task.total_length - task.completed_length, 0)
+            if task.status_enum == TaskStatus.COMPLETE or task.is_completed:
+                return 0.0
+            if task.download_speed <= 0:
+                return float("inf")
+            return remaining / task.download_speed
+        if column == 6:
+            return self._file_type_label(task).casefold()
+        return ""
+
+    @staticmethod
+    def _status_sort_rank(task: DownloadTask) -> int:
+        return {
+            TaskStatus.ACTIVE: 0,
+            TaskStatus.WAITING: 1,
+            TaskStatus.PAUSED: 2,
+            TaskStatus.ERROR: 3,
+            TaskStatus.FAILED: 3,
+            TaskStatus.COMPLETE: 4,
+            TaskStatus.REMOVED: 5,
+            TaskStatus.UNKNOWN: 6,
+        }.get(task.status_enum, 6)
 
     def _row_background(self, task: DownloadTask) -> QColor | None:
         if task.status == TaskStatus.ACTIVE.value:
@@ -481,19 +552,114 @@ class TaskItemDelegate(QStyledItemDelegate):
         painter.restore()
 
 
+class TaskHeaderView(QHeaderView):
+    def __init__(self, orientation: Qt.Orientation, theme: dict, parent=None) -> None:
+        super().__init__(orientation, parent)
+        self.theme = theme
+        self._sort_column = -1
+        self._sort_order = Qt.SortOrder.AscendingOrder
+
+    def set_task_sort_indicator(self, section: int, order: Qt.SortOrder) -> None:
+        self._sort_column = section
+        self._sort_order = order
+        self.viewport().update()
+
+    def _color(self, key: str, fallback: str) -> QColor:
+        return QColor(self.theme.get("colors", {}).get(key, fallback))
+
+    def paintSection(self, painter: QPainter, rect: QRect, logicalIndex: int) -> None:
+        if not rect.isValid():
+            return
+
+        painter.save()
+        gradient = QLinearGradient(
+            float(rect.left()),
+            float(rect.top()),
+            float(rect.left()),
+            float(rect.bottom()),
+        )
+        gradient.setColorAt(0, self._color("table_header_gradient_top", "#f4f8fd"))
+        gradient.setColorAt(0.55, self._color("table_header_gradient_mid", "#d4e0ee"))
+        gradient.setColorAt(1, self._color("table_header_gradient_bottom", "#bccdde"))
+        painter.fillRect(rect, gradient)
+
+        painter.setPen(QPen(self._color("table_header_border", "#92a4bb"), 1))
+        painter.drawRect(rect.adjusted(0, 0, -1, -1))
+
+        text = str(
+            self.model().headerData(
+                logicalIndex,
+                self.orientation(),
+                Qt.ItemDataRole.DisplayRole,
+            )
+            or ""
+        )
+        font = painter.font()
+        font.setBold(True)
+        painter.setFont(font)
+        text_color = self._color("table_header_text", "#21344e")
+        painter.setPen(text_color)
+
+        arrow_size = 7 if logicalIndex == self._sort_column else 0
+        gap = 4 if arrow_size else 0
+        metrics = painter.fontMetrics()
+        text = metrics.elidedText(
+            text,
+            Qt.TextElideMode.ElideRight,
+            max(1, rect.width() - arrow_size - gap - 8),
+        )
+        text_width = metrics.horizontalAdvance(text)
+        content_width = text_width + gap + arrow_size
+        left = rect.left() + max(4, (rect.width() - content_width) // 2)
+        text_rect = QRect(left, rect.top(), text_width, rect.height())
+        painter.drawText(
+            text_rect,
+            int(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter),
+            text,
+        )
+
+        if arrow_size:
+            center_x = text_rect.right() + gap + arrow_size // 2
+            center_y = rect.center().y()
+            if self._sort_order == Qt.SortOrder.AscendingOrder:
+                arrow = QPolygon(
+                    [
+                        QPoint(center_x, center_y - 3),
+                        QPoint(center_x - 4, center_y + 2),
+                        QPoint(center_x + 4, center_y + 2),
+                    ]
+                )
+            else:
+                arrow = QPolygon(
+                    [
+                        QPoint(center_x - 4, center_y - 2),
+                        QPoint(center_x + 4, center_y - 2),
+                        QPoint(center_x, center_y + 3),
+                    ]
+                )
+            painter.setBrush(text_color)
+            painter.setPen(Qt.PenStyle.NoPen)
+            painter.drawPolygon(arrow)
+
+        painter.restore()
+
+
 class TaskTableView(QTableView):
     def __init__(self, model: TaskTableModel, theme: dict, parent=None) -> None:
         super().__init__(parent)
         self.theme = theme
         self.setObjectName("taskTable")
         self.setModel(model)
+        self.setHorizontalHeader(TaskHeaderView(Qt.Orientation.Horizontal, theme, self))
         self.setSelectionBehavior(QTableView.SelectionBehavior.SelectRows)
         self.setSelectionMode(QTableView.SelectionMode.ExtendedSelection)
         self.setSortingEnabled(False)
         self.setAlternatingRowColors(False)
         self.setShowGrid(True)
         self.setWordWrap(False)
-        self.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+        self.setAutoScroll(True)
+        self.setDragEnabled(False)
         self.setIconSize(
             QSize(
                 int(self.theme.get("metrics", {}).get("table_status_icon_size", 16)),
@@ -511,6 +677,10 @@ class TaskTableView(QTableView):
         header.setSectionsMovable(True)
         header.setStretchLastSection(True)
         header.setMinimumSectionSize(55)
+        header.setSectionsClickable(True)
+        header.sectionClicked.connect(self._on_header_section_clicked)
+        self._sort_column = -1
+        self._sort_order = Qt.SortOrder.AscendingOrder
         for section in range(model.columnCount()):
             header.setSectionResizeMode(section, QHeaderView.ResizeMode.Interactive)
 
@@ -522,6 +692,102 @@ class TaskTableView(QTableView):
         self.setColumnWidth(4, int(metrics.get("column_size_width", 108)))
         self.setColumnWidth(5, int(metrics.get("column_eta_width", 120)))
         self.setColumnWidth(6, int(metrics.get("column_file_type_width", 120)))
+
+    def select_all_task_rows(self) -> None:
+        model = self.model()
+        selection_model = self.selectionModel()
+        if not isinstance(model, TaskTableModel) or selection_model is None:
+            return
+
+        selection_model.clearSelection()
+        first_selected_index = QModelIndex()
+        for row in range(model.rowCount()):
+            if model.is_child_row(row):
+                continue
+            index = model.index(row, 0)
+            if not first_selected_index.isValid():
+                first_selected_index = index
+            selection_model.select(
+                index,
+                selection_model.SelectionFlag.Select
+                | selection_model.SelectionFlag.Rows,
+            )
+        if first_selected_index.isValid():
+            selection_model.setCurrentIndex(
+                first_selected_index,
+                selection_model.SelectionFlag.NoUpdate,
+            )
+
+    def _on_header_section_clicked(self, section: int) -> None:
+        model = self.model()
+        if not isinstance(model, TaskTableModel):
+            return
+
+        if section == self._sort_column:
+            self._sort_order = (
+                Qt.SortOrder.DescendingOrder
+                if self._sort_order == Qt.SortOrder.AscendingOrder
+                else Qt.SortOrder.AscendingOrder
+            )
+        else:
+            self._sort_column = section
+            self._sort_order = Qt.SortOrder.AscendingOrder
+
+        selected_gids = self._selected_task_gids()
+        model.sort(section, self._sort_order)
+        header = self.horizontalHeader()
+        if isinstance(header, TaskHeaderView):
+            header.set_task_sort_indicator(section, self._sort_order)
+        self._restore_selected_task_gids(selected_gids)
+
+    def _selected_task_gids(self) -> list[str]:
+        model = self.model()
+        selection_model = self.selectionModel()
+        if not isinstance(model, TaskTableModel) or selection_model is None:
+            return []
+
+        gids: list[str] = []
+        seen: set[str] = set()
+        for index in selection_model.selectedRows():
+            task = model.get_owner_task_at_row(index.row())
+            if task and task.gid not in seen:
+                seen.add(task.gid)
+                gids.append(task.gid)
+        return gids
+
+    def _restore_selected_task_gids(self, gids: list[str]) -> None:
+        model = self.model()
+        selection_model = self.selectionModel()
+        if not isinstance(model, TaskTableModel) or selection_model is None:
+            return
+
+        with QSignalBlocker(selection_model):
+            selection_model.clearSelection()
+            first_selected_index = QModelIndex()
+            for gid in gids:
+                row = model.find_row_by_gid(gid)
+                if row < 0:
+                    continue
+                index = model.index(row, 0)
+                if not first_selected_index.isValid():
+                    first_selected_index = index
+                selection_model.select(
+                    index,
+                    selection_model.SelectionFlag.Select
+                    | selection_model.SelectionFlag.Rows,
+                )
+            if first_selected_index.isValid():
+                selection_model.setCurrentIndex(
+                    first_selected_index,
+                    selection_model.SelectionFlag.NoUpdate,
+                )
+
+    def keyPressEvent(self, event) -> None:
+        if event.matches(QKeySequence.StandardKey.SelectAll):
+            self.select_all_task_rows()
+            event.accept()
+            return
+        super().keyPressEvent(event)
 
     def mousePressEvent(self, event) -> None:
         if event.button() == Qt.MouseButton.LeftButton:

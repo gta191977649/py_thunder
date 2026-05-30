@@ -6,7 +6,7 @@ from pathlib import Path
 from urllib.parse import urlparse
 
 import requests
-from PyQt6.QtCore import QPoint, QRect, QSize, Qt, pyqtSignal
+from PyQt6.QtCore import QPoint, QRect, QSize, QSignalBlocker, Qt, pyqtSignal
 from PyQt6.QtGui import (
     QAction,
     QColor,
@@ -22,6 +22,7 @@ from PyQt6.QtGui import (
 from PyQt6.QtWidgets import (
     QApplication,
     QFrame,
+    QFileDialog,
     QHBoxLayout,
     QLabel,
     QMainWindow,
@@ -48,10 +49,14 @@ from core.download_manager import DownloadManager
 from core.formatters import format_bytes, format_duration, format_progress, format_speed
 from core.piece_map import PieceMapSnapshot
 from core.task_model import DownloadTask, ResumeSupport, TaskStatus
+from ui.batch_task_dialog import BatchTaskDialog
+from ui.file_menu import FileMenuCallbacks, build_file_menu
+from ui.file_menu import FileMenuActions
 from ui.new_task_dialog import NewTaskDialog
 from ui.piece_map_widget import PieceMapWidget
 from ui.sidebar import TaskSidebar
 from ui.task_table import TaskTableModel, TaskTableView
+from ui.thunder_menu import ThunderMenu, ThunderMenuStyle
 from ui.themed_checkbox import ThemedCheckBox
 
 
@@ -156,133 +161,13 @@ class RuntimeTabBar(QTabBar):
             )
 
 
-class TaskContextMenuStyle(QProxyStyle):
-    def __init__(self, theme: dict, base_style=None) -> None:
-        super().__init__(base_style)
-        self.theme = theme
-
-    def _color(self, key: str, fallback: str) -> QColor:
-        return QColor(self.theme.get("colors", {}).get(key, fallback))
-
-    def _metric(self, key: str, fallback: int) -> int:
-        return int(self.theme.get("metrics", {}).get(key, fallback))
-
-    def drawControl(self, element, option, painter, widget=None) -> None:
-        if (
-            element == QStyle.ControlElement.CE_MenuItem
-            and isinstance(option, QStyleOptionMenuItem)
-        ):
-            self._draw_menu_item(option, painter, widget)
-            return
-        super().drawControl(element, option, painter, widget)
-
-    def _draw_menu_item(
-        self,
-        option: QStyleOptionMenuItem,
-        painter: QPainter,
-        widget=None,
-    ) -> None:
-        rect = option.rect
-        strip_width = self._metric("context_menu_icon_strip_width", 26)
-        text_gap = self._metric("context_menu_text_gap", 12)
-        right_padding = self._metric("context_menu_padding_right", 14)
-        icon_offset_x = self._metric("context_menu_icon_offset_x", 0)
-        icon_offset_y = self._metric("context_menu_icon_offset_y", 0)
-        enabled = bool(option.state & QStyle.StateFlag.State_Enabled)
-        selected = bool(option.state & QStyle.StateFlag.State_Selected)
-        active_action = widget.activeAction() if isinstance(widget, QMenu) else None
-        if enabled and active_action and active_action.text() == option.text:
-            selected = True
-
-        painter.save()
-
-        if option.menuItemType == QStyleOptionMenuItem.MenuItemType.Separator:
-            pen = QPen(self._color("context_menu_separator", "#8f8f8f"), 1)
-            painter.setPen(pen)
-            y = rect.center().y()
-            painter.drawLine(rect.left() + strip_width + text_gap, y, rect.right() - 8, y)
-            painter.restore()
-            return
-
-        text_rect = rect.adjusted(strip_width + text_gap, 2, -right_padding, -2)
-        if selected:
-            hover_rect = text_rect.adjusted(-4, 0, 2, 0)
-            painter.fillRect(
-                hover_rect,
-                self._color("context_menu_hover_background", "#d2d2d2"),
-            )
-            painter.setPen(QPen(self._color("context_menu_hover_border", "#2f62c8"), 1))
-            painter.drawRect(hover_rect.adjusted(0, 0, -1, -1))
-
-        icon_strip_rect = QRect(rect.left(), rect.top(), strip_width, rect.height())
-        if not option.icon.isNull():
-            icon_size = self._metric("context_menu_icon_size", 18)
-            mode = QIcon.Mode.Normal if enabled else QIcon.Mode.Disabled
-            pixmap = option.icon.pixmap(QSize(icon_size, icon_size), mode)
-            icon_rect = QRect(0, 0, icon_size, icon_size)
-            icon_rect.moveLeft(
-                icon_strip_rect.left() + (icon_strip_rect.width() - icon_size) // 2
-            )
-            icon_rect.moveTop(
-                icon_strip_rect.top() + (icon_strip_rect.height() - icon_size) // 2
-            )
-            icon_rect.translate(icon_offset_x, icon_offset_y)
-            painter.drawPixmap(icon_rect, pixmap)
-
-        text = option.text.split("\t", 1)[0]
-        text_font = QFont(option.font)
-        text_font.setBold(False)
-        painter.setFont(text_font)
-
-        if not enabled:
-            text_color = self._color("context_menu_disabled_text", "#bcbcbc")
-        elif selected:
-            text_color = self._color("context_menu_hover_text", "#082955")
-        else:
-            text_color = self._color("context_menu_text", "#082955")
-
-        painter.setPen(text_color)
-        painter.drawText(
-            text_rect,
-            int(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter),
-            text,
-        )
-        painter.restore()
+class TaskContextMenuStyle(ThunderMenuStyle):
+    pass
 
 
-class TaskContextMenu(QMenu):
+class TaskContextMenu(ThunderMenu):
     def __init__(self, theme: dict, font: QFont, parent=None) -> None:
-        super().__init__(parent)
-        self.theme = theme
-        self.setObjectName("taskContextMenu")
-        menu_font = QFont(font)
-        menu_font.setBold(False)
-        self.setFont(menu_font)
-        self.setSeparatorsCollapsible(False)
-        self.setMouseTracking(True)
-        self._menu_style = TaskContextMenuStyle(theme, self.style())
-        self.setStyle(self._menu_style)
-        self.hovered.connect(lambda _action: self.update())
-
-    def _color(self, key: str, fallback: str) -> QColor:
-        return QColor(self.theme.get("colors", {}).get(key, fallback))
-
-    def _metric(self, key: str, fallback: int) -> int:
-        return int(self.theme.get("metrics", {}).get(key, fallback))
-
-    def paintEvent(self, event) -> None:
-        painter = QPainter(self)
-        painter.fillRect(self.rect(), self._color("context_menu_background", "#fffef9"))
-        painter.fillRect(
-            0,
-            0,
-            self._metric("context_menu_icon_strip_width", 26),
-            self.height(),
-            self._color("context_menu_icon_strip_background", "#d5d5ba"),
-        )
-        painter.setPen(QPen(self._color("context_menu_border", "#7d7d7d"), 1))
-        painter.drawRect(self.rect().adjusted(0, 0, -1, -1))
-        super().paintEvent(event)
+        super().__init__(theme, font, "", parent)
 
 
 class MainWindow(QMainWindow):
@@ -302,7 +187,7 @@ class MainWindow(QMainWindow):
         self.theme = theme
         self.translator = translator
         self.download_manager = download_manager
-        self.all_tasks = initial_tasks or []
+        self.all_tasks = self.download_manager.sort_tasks(initial_tasks or [])
         self.current_filter = "all"
         self._aria2_warning_shown = False
         self._selected_task_gids: list[str] = []
@@ -361,18 +246,6 @@ class MainWindow(QMainWindow):
     def _build_menu(self) -> None:
         menu_bar = self.menuBar()
         menu_bar.setFont(self.ui_font)
-        for key in [
-            "menu.file",
-            "menu.edit",
-            "menu.view",
-            "menu.settings",
-            "menu.center",
-            "menu.tools",
-            "menu.help",
-        ]:
-            menu = menu_bar.addMenu(self.translator.t(key))
-            menu.setFont(self.ui_font)
-
         self.new_task_action = QAction(self.translator.t("action.new_task"), self)
         self.start_action = QAction(self.translator.t("action.start"), self)
         self.pause_action = QAction(self.translator.t("action.pause"), self)
@@ -390,12 +263,56 @@ class MainWindow(QMainWindow):
         self.open_folder_action.triggered.connect(self.open_selected_folder)
         self.settings_action.triggered.connect(self.show_settings_placeholder)
 
+        self.file_menu_actions: FileMenuActions = build_file_menu(
+            parent=self,
+            menu_bar=menu_bar,
+            translator=self.translator,
+            theme=self.theme,
+            font=self.ui_font,
+            icon_loader=self._load_menu_icon,
+            callbacks=FileMenuCallbacks(
+                new_task=self.open_new_task_dialog,
+                open_torrent=self.open_torrent_file_dialog,
+                move_to=self.move_selected_tasks_to_directory,
+                start_selected=self.resume_selected_task,
+                pause_selected=self.pause_selected_task,
+                remove_selected=self.remove_selected_task,
+                redownload_selected=self.redownload_selected_tasks,
+                batch_new=self.open_batch_task_dialog,
+                start_all=self.start_all_tasks,
+                pause_all=self.pause_all_tasks,
+                remove_all=self.remove_all_tasks,
+                clear_trash=self.clear_trash_tasks,
+                import_unfinished=self.import_unfinished_downloads,
+                import_list=self.import_download_list,
+                export_list=self.export_download_list,
+                quit_app=self.close,
+            ),
+        )
+
+        for key in [
+            "menu.edit",
+            "menu.view",
+            "menu.settings",
+            "menu.center",
+            "menu.tools",
+            "menu.help",
+        ]:
+            menu_bar.addMenu(ThunderMenu(self.theme, self.ui_font, self.translator.t(key), menu_bar))
+
     def _install_shortcuts(self) -> None:
         self.delete_shortcut = QShortcut(QKeySequence("Delete"), self)
         self.delete_shortcut.activated.connect(self.remove_selected_task)
         self.permanent_delete_shortcut = QShortcut(QKeySequence("Shift+Delete"), self)
         self.permanent_delete_shortcut.activated.connect(
             self.permanently_delete_selected_task
+        )
+        self.select_all_shortcut = QShortcut(
+            QKeySequence.StandardKey.SelectAll,
+            self.task_table,
+        )
+        self.select_all_shortcut.activated.connect(
+            self.task_table.select_all_task_rows
         )
 
     def _build_central_ui(self) -> None:
@@ -696,30 +613,42 @@ class MainWindow(QMainWindow):
         return icon
 
     def _load_menu_icon(self, icon_kind: str) -> QIcon:
-        icons_dir = get_thunder5_icons_dir() / "menu"
-        normal_path = icons_dir / f"{icon_kind}.png"
-        disabled_path = icons_dir / f"{icon_kind}_disabled.png"
+        menu_icons_dir = get_thunder5_icons_dir() / "menu"
+        toolbar_icons_dir = get_thunder5_icons_dir() / "toolbar"
+        normal_path = menu_icons_dir / f"{icon_kind}.png"
+        disabled_path = menu_icons_dir / f"{icon_kind}_disabled.png"
+
+        if not normal_path.exists():
+            normal_path = toolbar_icons_dir / f"{icon_kind}_normal.png"
+        if not disabled_path.exists():
+            disabled_path = toolbar_icons_dir / f"{icon_kind}_disabled.png"
+
         icon = QIcon()
-        icon.addFile(str(normal_path), mode=QIcon.Mode.Normal, state=QIcon.State.Off)
+        if normal_path.exists():
+            icon.addFile(str(normal_path), mode=QIcon.Mode.Normal, state=QIcon.State.Off)
+            icon.addFile(str(normal_path), mode=QIcon.Mode.Active, state=QIcon.State.Off)
+            icon.addFile(str(normal_path), mode=QIcon.Mode.Selected, state=QIcon.State.Off)
         if disabled_path.exists():
             icon.addFile(
                 str(disabled_path),
                 mode=QIcon.Mode.Disabled,
                 state=QIcon.State.Off,
             )
+        if icon.isNull():
+            return QIcon(str(get_thunder5_icons_dir() / "app_icon.png"))
         return icon
 
     def on_tasks_updated(self, tasks: list[DownloadTask]) -> None:
-        self.all_tasks = tasks
+        self.all_tasks = self.download_manager.sort_tasks(tasks)
         for task in tasks:
             if task.resume_support:
                 self._resume_support_cache[task.gid] = task.resume_support
-        self.sidebar.set_task_counts(tasks)
-        self._log_status_transitions(tasks)
+        self.sidebar.set_task_counts(self.all_tasks)
+        self._log_status_transitions(self.all_tasks)
         self._refresh_task_view()
-        self._update_global_speed_label(tasks)
+        self._update_global_speed_label(self.all_tasks)
         self.statusBar().showMessage(
-            self.translator.t("status.loaded", count=len(tasks)),
+            self.translator.t("status.loaded", count=len(self.all_tasks)),
             2000,
         )
         self._update_task_info_panel()
@@ -767,12 +696,210 @@ class MainWindow(QMainWindow):
                 QMessageBox.warning(
                     self,
                     self.translator.t("dialog.invalid_url.title"),
-                    self.translator.t("warn.invalid_url"),
+                    self.translator.t("warn.invalid_source_url"),
                 )
                 return
             if gid:
                 self._selected_task_gids = [gid]
                 self.statusBar().showMessage(self.translator.t("status.added"), 3000)
+
+    def open_batch_task_dialog(self) -> None:
+        dialog = BatchTaskDialog(
+            self.config.default_download_dir,
+            self.translator,
+            self.theme,
+            self,
+        )
+        dialog.setFont(self.ui_font)
+        if not dialog.exec():
+            return
+
+        urls, download_dir = dialog.get_values()
+        if dialog.should_save_as_default() and download_dir:
+            self.config.default_download_dir = download_dir
+            self.config.save()
+
+        gids, errors = self.download_manager.add_uri_tasks(urls, download_dir)
+        if gids:
+            self._selected_task_gids = gids
+            self.statusBar().showMessage(
+                self.translator.t("status.batch_added", count=len(gids)),
+                3000,
+            )
+        if errors:
+            self.on_task_error("\n".join(errors[:3]))
+
+    def open_torrent_file_dialog(self) -> None:
+        torrent_path, _selected_filter = QFileDialog.getOpenFileName(
+            self,
+            self.translator.t("dialog.open_torrent.title"),
+            self.config.default_download_dir,
+            "Torrent Files (*.torrent);;All Files (*)",
+        )
+        if not torrent_path:
+            return
+
+        download_dir = QFileDialog.getExistingDirectory(
+            self,
+            self.translator.t("dialog.new_task.select_dir"),
+            self.config.default_download_dir,
+        )
+        if not download_dir:
+            return
+
+        gid = self.download_manager.add_torrent_task(torrent_path, download_dir)
+        if gid:
+            self._selected_task_gids = [gid]
+            self.statusBar().showMessage(
+                self.translator.t("status.torrent_added"),
+                3000,
+            )
+
+    def open_selected_file_from_menu(self) -> None:
+        task = self._selected_task()
+        if not task:
+            self.statusBar().showMessage(self.translator.t("status.no_selection"), 3000)
+            return
+        self._open_completed_task_file(task)
+
+    def open_selected_url_from_menu(self) -> None:
+        self._browse_selected_url()
+
+    def move_selected_tasks_to_directory(self) -> None:
+        tasks = self._selected_tasks()
+        if not tasks:
+            self.statusBar().showMessage(self.translator.t("status.no_selection"), 3000)
+            return
+
+        destination_dir = QFileDialog.getExistingDirectory(
+            self,
+            self.translator.t("dialog.move_to.title"),
+            self.config.default_download_dir,
+        )
+        if not destination_dir:
+            return
+
+        moved_count, errors = self.download_manager.move_tasks_to_directory(
+            tasks,
+            destination_dir,
+        )
+        if moved_count:
+            self.statusBar().showMessage(
+                self.translator.t("status.tasks_moved", count=moved_count),
+                3000,
+            )
+        if errors:
+            self.on_task_error(", ".join(errors[:5]))
+
+    def redownload_selected_tasks(self) -> None:
+        tasks = self._selected_tasks()
+        if not tasks:
+            self.statusBar().showMessage(self.translator.t("status.no_selection"), 3000)
+            return
+        gids, errors = self.download_manager.redownload_tasks(tasks)
+        if gids:
+            self._selected_task_gids = gids
+            self.statusBar().showMessage(
+                self.translator.t("status.redownload_started"),
+                3000,
+            )
+        if errors:
+            self.on_task_error(", ".join(errors[:5]))
+
+    def start_all_tasks(self) -> None:
+        self._run_on_tasks(self.all_tasks, self.download_manager.resume_tasks)
+
+    def pause_all_tasks(self) -> None:
+        self._run_on_tasks(self.all_tasks, self.download_manager.pause_tasks)
+
+    def remove_all_tasks(self) -> None:
+        tasks = [
+            task
+            for task in self.all_tasks
+            if task.status_enum != TaskStatus.REMOVED
+        ]
+        self._remove_tasks(tasks)
+
+    def clear_trash_tasks(self) -> None:
+        deleted_count = self.download_manager.clear_trash()
+        self.statusBar().showMessage(
+            self.translator.t("status.trash_cleared", count=deleted_count),
+            3000,
+        )
+
+    def import_unfinished_downloads(self) -> None:
+        self._import_task_list(only_incomplete=True)
+
+    def import_download_list(self) -> None:
+        self._import_task_list(only_incomplete=False)
+
+    def export_download_list(self) -> None:
+        tasks = self.download_manager.list_exportable_tasks()
+        if not tasks:
+            QMessageBox.information(
+                self,
+                self.translator.t("dialog.export_list.empty.title"),
+                self.translator.t("dialog.export_list.empty.body"),
+            )
+            return
+
+        file_path, selected_filter = QFileDialog.getSaveFileName(
+            self,
+            self.translator.t("dialog.export_list.title"),
+            str(Path(self.config.default_download_dir) / "pythunder-download-list.json"),
+            "JSON Files (*.json);;Text Files (*.txt)",
+        )
+        if not file_path:
+            return
+        if not Path(file_path).suffix:
+            suffix = ".txt" if "Text" in selected_filter else ".json"
+            file_path = f"{file_path}{suffix}"
+        try:
+            count = self.download_manager.export_task_list(file_path, tasks)
+        except ValueError as exc:
+            QMessageBox.warning(
+                self,
+                self.translator.t("dialog.task_list_error.title"),
+                str(exc),
+            )
+            return
+        self.statusBar().showMessage(
+            self.translator.t("status.exported_tasks", count=count),
+            3000,
+        )
+
+    def _import_task_list(self, *, only_incomplete: bool) -> None:
+        file_path, _selected_filter = QFileDialog.getOpenFileName(
+            self,
+            self.translator.t("dialog.import_list.title"),
+            self.config.default_download_dir,
+            "Task Lists (*.json *.txt);;JSON Files (*.json);;Text Files (*.txt)",
+        )
+        if not file_path:
+            return
+
+        try:
+            gids, errors = self.download_manager.import_task_list(
+                file_path,
+                self.config.default_download_dir,
+                only_incomplete=only_incomplete,
+            )
+        except ValueError as exc:
+            QMessageBox.warning(
+                self,
+                self.translator.t("dialog.task_list_error.title"),
+                str(exc),
+            )
+            return
+
+        if gids:
+            self._selected_task_gids = gids
+            self.statusBar().showMessage(
+                self.translator.t("status.imported_tasks", count=len(gids)),
+                3000,
+            )
+        if errors:
+            self.on_task_error(", ".join(errors[:5]))
 
     def pause_selected_task(self) -> None:
         tasks = self._selected_tasks()
@@ -975,17 +1102,27 @@ class MainWindow(QMainWindow):
             self._selected_task_gids = []
             return
 
-        selection_model.clearSelection()
-        for row in rows:
-            index = self.task_model.index(row, 0)
-            selection_model.select(
-                index,
-                selection_model.SelectionFlag.Select
-                | selection_model.SelectionFlag.Rows,
-            )
+        with QSignalBlocker(selection_model):
+            selection_model.clearSelection()
+            for row in rows:
+                index = self.task_model.index(row, 0)
+                selection_model.select(
+                    index,
+                    selection_model.SelectionFlag.Select
+                    | selection_model.SelectionFlag.Rows,
+                )
 
-        current_index = self.task_model.index(rows[0], 0)
-        self.task_table.setCurrentIndex(current_index)
+            current_index = self.task_model.index(rows[0], 0)
+            selection_model.setCurrentIndex(
+                current_index,
+                selection_model.SelectionFlag.NoUpdate,
+            )
+        restored_gids: list[str] = []
+        for row in rows:
+            task = self.task_model.get_task_at_row(row)
+            if task is not None:
+                restored_gids.append(task.gid)
+        self._selected_task_gids = restored_gids
         if scroll_to_current:
             self.task_table.scrollTo(current_index)
 
@@ -1088,7 +1225,7 @@ class MainWindow(QMainWindow):
         menu.addSeparator()
 
         select_all_action = QAction(self.translator.t("context.select_all"), menu)
-        select_all_action.triggered.connect(self.task_table.selectAll)
+        select_all_action.triggered.connect(self.task_table.select_all_task_rows)
         menu.addAction(select_all_action)
 
         start_all_action = QAction(self.translator.t("context.start_all"), menu)
@@ -1315,11 +1452,26 @@ class MainWindow(QMainWindow):
         can_start = self.download_manager.can_resume_tasks(selected_tasks)
         can_pause = self.download_manager.can_pause_tasks(selected_tasks)
         can_remove = self.download_manager.can_remove_tasks(selected_tasks)
+        can_move = self.download_manager.can_move_tasks(selected_tasks)
         can_open_folder = (
             selected_task is not None
             and bool(selected_task.save_path)
             and len(selected_tasks) == 1
         )
+        can_open_file = (
+            selected_task is not None
+            and len(selected_tasks) == 1
+            and (
+                selected_task.status_enum == TaskStatus.COMPLETE
+                or selected_task.is_completed
+            )
+        )
+        can_open_url = any(task.url for task in selected_tasks)
+        all_tasks = list(self.all_tasks)
+        has_tasks = bool(all_tasks)
+        trash_tasks = [
+            task for task in all_tasks if task.status_enum == TaskStatus.REMOVED
+        ]
 
         self.new_task_action.setEnabled(True)
         self.start_action.setEnabled(has_selection and can_start)
@@ -1327,6 +1479,27 @@ class MainWindow(QMainWindow):
         self.remove_action.setEnabled(has_selection and can_remove)
         self.open_folder_action.setEnabled(can_open_folder)
         self.settings_action.setEnabled(True)
+
+        self.file_menu_actions.new_task.setEnabled(True)
+        self.file_menu_actions.open_torrent.setEnabled(True)
+        self.file_menu_actions.move_to.setEnabled(has_selection and can_move)
+        self.file_menu_actions.start_selected.setEnabled(has_selection and can_start)
+        self.file_menu_actions.pause_selected.setEnabled(has_selection and can_pause)
+        self.file_menu_actions.remove_selected.setEnabled(has_selection and can_remove)
+        self.file_menu_actions.redownload_selected.setEnabled(has_selection)
+        self.file_menu_actions.batch_new.setEnabled(True)
+        self.file_menu_actions.start_all.setEnabled(
+            has_tasks and self.download_manager.can_resume_tasks(all_tasks)
+        )
+        self.file_menu_actions.pause_all.setEnabled(
+            has_tasks and self.download_manager.can_pause_tasks(all_tasks)
+        )
+        self.file_menu_actions.remove_all.setEnabled(has_tasks)
+        self.file_menu_actions.clear_trash.setEnabled(bool(trash_tasks))
+        self.file_menu_actions.import_unfinished.setEnabled(True)
+        self.file_menu_actions.import_list.setEnabled(True)
+        self.file_menu_actions.export_list.setEnabled(True)
+        self.file_menu_actions.quit_app.setEnabled(True)
 
     def _update_task_info_panel(self) -> None:
         task = self._selected_task()

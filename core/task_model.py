@@ -79,6 +79,8 @@ class DownloadTask:
     def can_resume(self) -> bool:
         if self.status_enum == TaskStatus.PAUSED:
             return True
+        if self.status_enum in {TaskStatus.ERROR, TaskStatus.FAILED}:
+            return bool(self.url)
         return (
             self.status_enum == TaskStatus.REMOVED
             and bool(self.url)

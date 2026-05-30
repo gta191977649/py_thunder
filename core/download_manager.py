@@ -20,6 +20,7 @@ from core.task_model import (
     utc_now_iso,
 )
 from services.os_integration import OSIntegrationService
+from services.task_list_exchange import TaskListExchangeService
 from storage.task_repository import TaskRepository
 
 
@@ -55,6 +56,7 @@ class DownloadManager(QObject):
         self._ui_state_overrides: dict[str, TaskUiOverride] = {}
         self._piece_map_parser = Aria2ControlFileParser()
         self._piece_map_cache: dict[str, tuple[tuple[str, int, int], PieceMapSnapshot]] = {}
+        self.task_list_exchange = TaskListExchangeService()
 
     def start(self) -> None:
         if not self.timer.isActive():
@@ -65,9 +67,12 @@ class DownloadManager(QObject):
         self.timer.stop()
 
     def add_http_task(self, url: str, download_dir: str):
+        return self.add_uri_task(url, download_dir)
+
+    def add_uri_task(self, url: str, download_dir: str):
         normalized_url = url.strip()
-        if not self._is_http_url(normalized_url):
-            raise ValueError("Please enter a valid HTTP or HTTPS URL.")
+        if not self._is_supported_source_url(normalized_url):
+            raise ValueError("Please enter a valid download URL.")
 
         target_dir = Path(download_dir or "").expanduser()
         target_dir.mkdir(parents=True, exist_ok=True)
@@ -94,6 +99,57 @@ class DownloadManager(QObject):
         except Aria2RPCError as exc:
             self._update_aria2_state_from_error(exc)
             self.task_error.emit(f"Unable to add download task: {exc}")
+            return None
+
+    def add_uri_tasks(
+        self,
+        urls: list[str],
+        download_dir: str,
+    ) -> tuple[list[str], list[str]]:
+        gids: list[str] = []
+        errors: list[str] = []
+        for url in urls:
+            try:
+                gid = self.add_uri_task(url, download_dir)
+            except ValueError as exc:
+                errors.append(f"{url}: {exc}")
+                continue
+            if gid:
+                gids.append(gid)
+            else:
+                errors.append(url)
+        return gids, errors
+
+    def add_torrent_task(self, torrent_path: str, download_dir: str) -> str | None:
+        source = Path(torrent_path).expanduser()
+        if not source.exists():
+            raise ValueError(f"Torrent file was not found: {source}")
+
+        target_dir = Path(download_dir or "").expanduser()
+        target_dir.mkdir(parents=True, exist_ok=True)
+
+        try:
+            gid = self.client.add_torrent(str(source), {"dir": str(target_dir)})
+            try:
+                raw_task = self.client.tell_status(gid)
+                task = aria2_dict_to_download_task(raw_task)
+            except Aria2RPCError:
+                task = DownloadTask(
+                    gid=gid,
+                    name=source.name,
+                    url=source.as_uri(),
+                    save_path=str(target_dir),
+                    status=TaskStatus.WAITING.value,
+                    created_at=utc_now_iso(),
+                )
+
+            self.repository.upsert_from_download_task(task)
+            self._set_aria2_state(True)
+            self.sync_tasks()
+            return gid
+        except Aria2RPCError as exc:
+            self._update_aria2_state_from_error(exc)
+            self.task_error.emit(f"Unable to add torrent task: {exc}")
             return None
 
     def pause_task(self, gid: str) -> None:
@@ -190,7 +246,7 @@ class DownloadManager(QObject):
                 self._apply_ui_override(task)
 
             self._set_aria2_state(True)
-            self.tasks_updated.emit(self._sort_tasks(repository_tasks.values()))
+            self.tasks_updated.emit(self.sort_tasks(repository_tasks.values()))
         except Aria2RPCError as exc:
             self._update_aria2_state_from_error(exc)
             self._emit_persisted_tasks()
@@ -253,12 +309,17 @@ class DownloadManager(QObject):
         any_success = False
         for task in actionable_tasks:
             try:
-                if task.status_enum == TaskStatus.REMOVED:
+                if task.status_enum in {TaskStatus.ERROR, TaskStatus.FAILED}:
+                    new_gid = self.redownload_task(task)
+                    if new_gid:
+                        any_success = True
+                elif task.status_enum == TaskStatus.REMOVED:
                     self._restore_removed_task(task)
+                    any_success = True
                 else:
                     self.client.unpause(task.gid)
                     self._optimistically_update_task(task.gid, "resume")
-                any_success = True
+                    any_success = True
                 self._set_aria2_state(True)
             except Aria2RPCError as exc:
                 self._update_aria2_state_from_error(exc)
@@ -417,7 +478,7 @@ class DownloadManager(QObject):
             self._set_aria2_state(False, str(exc))
 
     def _emit_persisted_tasks(self) -> None:
-        self.tasks_updated.emit(self._sort_tasks(self.repository.list_all()))
+        self.tasks_updated.emit(self.sort_tasks(self.repository.list_all()))
 
     def _set_aria2_state(self, online: bool, message: str = "") -> None:
         previous_state = self._aria2_online
@@ -429,12 +490,26 @@ class DownloadManager(QObject):
             self._last_aria2_message = message
             self.aria2_unavailable.emit(message)
 
-    def _sort_tasks(self, tasks) -> list[DownloadTask]:
+    def sort_tasks(self, tasks) -> list[DownloadTask]:
         return sorted(
             tasks,
-            key=lambda task: (task.created_at or "", task.gid),
-            reverse=True,
+            key=self._task_sort_key,
         )
+
+    def _task_sort_key(self, task: DownloadTask) -> tuple[int, float, str]:
+        status_rank = {
+            TaskStatus.ACTIVE: 0,
+            TaskStatus.WAITING: 1,
+            TaskStatus.PAUSED: 2,
+            TaskStatus.ERROR: 3,
+            TaskStatus.FAILED: 3,
+            TaskStatus.COMPLETE: 4,
+            TaskStatus.REMOVED: 5,
+            TaskStatus.UNKNOWN: 6,
+        }.get(task.status_enum, 6)
+        created_at = parse_iso_datetime(task.created_at)
+        created_ts = created_at.timestamp() if created_at else 0.0
+        return status_rank, -created_ts, task.gid
 
     def filter_tasks(
         self,
@@ -452,6 +527,9 @@ class DownloadManager(QObject):
     def can_remove_tasks(self, tasks: list[DownloadTask]) -> bool:
         return any(task.can_remove for task in tasks)
 
+    def can_move_tasks(self, tasks: list[DownloadTask]) -> bool:
+        return any(self._can_move_task(task) for task in tasks)
+
     def open_task_folder(self, task: DownloadTask) -> None:
         self.os_service.reveal_task_in_folder(task)
 
@@ -460,6 +538,97 @@ class DownloadManager(QObject):
 
     def task_file_exists(self, task: DownloadTask) -> bool:
         return self.os_service.task_file_exists(task)
+
+    def redownload_tasks(
+        self,
+        tasks: list[DownloadTask],
+    ) -> tuple[list[str], list[str]]:
+        gids: list[str] = []
+        errors: list[str] = []
+        for task in tasks:
+            try:
+                gid = self.redownload_task(task)
+            except ValueError as exc:
+                errors.append(f"{task.name}: {exc}")
+                continue
+            if gid:
+                gids.append(gid)
+            else:
+                errors.append(task.name)
+        return gids, errors
+
+    def move_tasks_to_directory(
+        self,
+        tasks: list[DownloadTask],
+        destination_dir: str,
+    ) -> tuple[int, list[str]]:
+        moved_count = 0
+        errors: list[str] = []
+        for task in tasks:
+            if not self._can_move_task(task):
+                errors.append(task.name)
+                continue
+            try:
+                self.os_service.move_task_files(task, destination_dir)
+                task.save_path = str(Path(destination_dir).expanduser())
+                task.updated_at = utc_now_iso()
+                self.repository.upsert_from_download_task(task)
+                moved_count += 1
+            except (RuntimeError, ValueError, FileNotFoundError, FileExistsError):
+                errors.append(task.name)
+        if moved_count:
+            self._emit_persisted_tasks()
+        return moved_count, errors
+
+    def clear_trash(self) -> int:
+        trash_tasks = [
+            task
+            for task in self.repository.list_all()
+            if task.status_enum == TaskStatus.REMOVED
+        ]
+        if not trash_tasks:
+            return 0
+        self.permanently_delete_tasks(trash_tasks, delete_files=False)
+        return len(trash_tasks)
+
+    def list_exportable_tasks(self) -> list[DownloadTask]:
+        return [task for task in self.repository.list_all() if task.url.strip()]
+
+    def export_task_list(
+        self,
+        path: str,
+        tasks: list[DownloadTask] | None = None,
+    ) -> int:
+        if tasks is None:
+            tasks = self.list_exportable_tasks()
+        self.task_list_exchange.export_tasks(tasks, path)
+        return len(tasks)
+
+    def import_task_list(
+        self,
+        path: str,
+        default_download_dir: str,
+        *,
+        only_incomplete: bool = False,
+    ) -> tuple[list[str], list[str]]:
+        entries = self.task_list_exchange.load_entries(path)
+        if only_incomplete:
+            entries = [entry for entry in entries if entry.is_incomplete]
+
+        gids: list[str] = []
+        errors: list[str] = []
+        for entry in entries:
+            target_dir = entry.save_path or default_download_dir
+            try:
+                gid = self.add_uri_task(entry.url, target_dir)
+            except ValueError as exc:
+                errors.append(f"{entry.url}: {exc}")
+                continue
+            if gid:
+                gids.append(gid)
+            else:
+                errors.append(entry.url)
+        return gids, errors
 
     def get_task_piece_map_snapshot(
         self,
@@ -804,10 +973,31 @@ class DownloadManager(QObject):
         return parsed.scheme in {"http", "https"} and bool(parsed.netloc)
 
     @staticmethod
+    def _is_magnet_url(url: str) -> bool:
+        return url.lower().startswith("magnet:?")
+
+    @classmethod
+    def _is_supported_source_url(cls, url: str) -> bool:
+        return cls._is_http_url(url) or cls._is_magnet_url(url)
+
+    @staticmethod
     def _is_bt_task(task: DownloadTask) -> bool:
         url = (task.url or "").lower()
         name = (task.name or "").lower()
         return url.startswith("magnet:") or name.endswith(".torrent")
+
+    @staticmethod
+    def _can_move_task(task: DownloadTask) -> bool:
+        return (
+            task.status_enum
+            in {
+                TaskStatus.COMPLETE,
+                TaskStatus.ERROR,
+                TaskStatus.FAILED,
+                TaskStatus.REMOVED,
+            }
+            and bool(task.save_path)
+        )
 
     def _build_server_runtime_lines(
         self,

@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import base64
 import uuid
+from pathlib import Path
 
 import requests
 
@@ -76,6 +78,22 @@ class Aria2Client:
         if options:
             params.append(options)
         return self.call("addUri", params)
+
+    def add_torrent(
+        self,
+        torrent_path: str,
+        options: dict | None = None,
+        uris: list[str] | None = None,
+    ):
+        torrent_data = base64.b64encode(
+            Path(torrent_path).read_bytes()
+        ).decode("ascii")
+        params: list = [torrent_data]
+        if uris is not None or options is not None:
+            params.append(uris or [])
+        if options:
+            params.append(options)
+        return self.call("addTorrent", params)
 
     def pause(self, gid: str):
         return self.call("pause", [gid])

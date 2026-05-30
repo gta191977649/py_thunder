@@ -20,7 +20,7 @@ FALLBACK_THEME = {
         "menu_hover_border": "#8ea2c0",
         "context_menu_background": "#fffef9",
         "context_menu_border": "#7d7d7d",
-        "context_menu_icon_strip_background": "#d5d5ba",
+        "context_menu_icon_strip_background": "#f0f0d2",
         "context_menu_text": "#082955",
         "context_menu_disabled_text": "#bcbcbc",
         "context_menu_hover_background": "#d2d2d2",
@@ -321,7 +321,7 @@ QMenu {{
     font-size: {base_font_size}pt;
 }}
 
-QMenu#taskContextMenu {{
+QMenu#thunderMenu {{
     background: transparent;
     border: 1px solid transparent;
     padding: 2px 0;
@@ -329,7 +329,7 @@ QMenu#taskContextMenu {{
     font-weight: normal;
 }}
 
-QMenu#taskContextMenu::item {{
+QMenu#thunderMenu::item {{
     min-height: {theme['metrics'].get('context_menu_item_height', 22)}px;
     padding: 2px {theme['metrics'].get('context_menu_padding_right', 14)}px 2px {theme['metrics'].get('context_menu_padding_left', 18)}px;
     color: {colors['context_menu_text']};
@@ -337,7 +337,7 @@ QMenu#taskContextMenu::item {{
     text-align: left;
 }}
 
-QMenu#taskContextMenu::item:selected {{
+QMenu#thunderMenu::item:selected {{
     background: qlineargradient(
         x1:0, y1:0, x2:1, y2:0,
         stop:0 {colors['context_menu_icon_strip_background']},
@@ -349,11 +349,11 @@ QMenu#taskContextMenu::item:selected {{
     color: {colors['context_menu_hover_text']};
 }}
 
-QMenu#taskContextMenu::item:disabled {{
+QMenu#thunderMenu::item:disabled {{
     color: {colors['context_menu_disabled_text']};
 }}
 
-QMenu#taskContextMenu::separator {{
+QMenu#thunderMenu::separator {{
     height: 1px;
     background: {colors['context_menu_separator']};
     margin: 5px 8px 5px 26px;
