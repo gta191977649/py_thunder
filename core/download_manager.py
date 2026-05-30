@@ -7,7 +7,7 @@ from urllib.parse import urlparse
 
 from PyQt6.QtCore import QObject, QTimer, pyqtSignal
 
-from core.aria2_client import Aria2Client, Aria2RPCError
+from core.aria2_client import Aria2Client, Aria2ConnectionError, Aria2RPCError
 from core.formatters import format_speed
 from core.piece_map import Aria2ControlFileParser, PieceMapSnapshot
 from core.task_mapper import aria2_dict_to_download_task
@@ -92,7 +92,7 @@ class DownloadManager(QObject):
             self.sync_tasks()
             return gid
         except Aria2RPCError as exc:
-            self._set_aria2_state(False, str(exc))
+            self._update_aria2_state_from_error(exc)
             self.task_error.emit(f"Unable to add download task: {exc}")
             return None
 
@@ -126,7 +126,7 @@ class DownloadManager(QObject):
                 self.repository.mark_removed(gid)
                 self._emit_persisted_tasks()
                 return
-            self._set_aria2_state(False, str(exc))
+            self._update_aria2_state_from_error(exc)
             self.task_error.emit(f"Unable to remove task: {exc}")
 
     def remove_tasks(self, gids: list[str]) -> None:
@@ -192,7 +192,7 @@ class DownloadManager(QObject):
             self._set_aria2_state(True)
             self.tasks_updated.emit(self._sort_tasks(repository_tasks.values()))
         except Aria2RPCError as exc:
-            self._set_aria2_state(False, str(exc))
+            self._update_aria2_state_from_error(exc)
             self._emit_persisted_tasks()
         except Exception as exc:  # pragma: no cover - defensive UI safety
             self.task_error.emit(f"Unexpected sync error: {exc}")
@@ -206,7 +206,7 @@ class DownloadManager(QObject):
             self._set_aria2_state(True)
             self.sync_tasks()
         except Aria2RPCError as exc:
-            self._set_aria2_state(False, str(exc))
+            self._update_aria2_state_from_error(exc)
             self.task_error.emit(f"Unable to {action_name} task: {exc}")
 
     def _run_task_actions(
@@ -233,7 +233,7 @@ class DownloadManager(QObject):
                 self._set_aria2_state(True)
                 self._optimistically_update_task(gid, action_name)
             except Aria2RPCError as exc:
-                self._set_aria2_state(False, str(exc))
+                self._update_aria2_state_from_error(exc)
                 self.task_error.emit(f"Unable to {action_name} task: {exc}")
 
         if any_success:
@@ -261,7 +261,7 @@ class DownloadManager(QObject):
                 any_success = True
                 self._set_aria2_state(True)
             except Aria2RPCError as exc:
-                self._set_aria2_state(False, str(exc))
+                self._update_aria2_state_from_error(exc)
                 self.task_error.emit(f"Unable to resume task: {exc}")
             except ValueError as exc:
                 self.task_error.emit(f"Unable to resume task: {exc}")
@@ -392,7 +392,7 @@ class DownloadManager(QObject):
             self.repository.delete_by_gid(task.gid)
             return True
         except Aria2RPCError as exc:
-            self._set_aria2_state(False, str(exc))
+            self._update_aria2_state_from_error(exc)
             self.task_error.emit(f"Unable to permanently delete task: {exc}")
             return False
         except (RuntimeError, ValueError) as exc:
@@ -408,8 +408,13 @@ class DownloadManager(QObject):
             "gid is not found",
             "download result not found",
             "active download not found",
+            "invalid gid",
         )
         return any(marker in message for marker in missing_markers)
+
+    def _update_aria2_state_from_error(self, exc: Aria2RPCError) -> None:
+        if isinstance(exc, Aria2ConnectionError):
+            self._set_aria2_state(False, str(exc))
 
     def _emit_persisted_tasks(self) -> None:
         self.tasks_updated.emit(self._sort_tasks(self.repository.list_all()))
@@ -737,7 +742,7 @@ class DownloadManager(QObject):
             self.sync_tasks()
             return new_gid
         except Aria2RPCError as exc:
-            self._set_aria2_state(False, str(exc))
+            self._update_aria2_state_from_error(exc)
             self.task_error.emit(f"Unable to re-download task: {exc}")
             return None
 

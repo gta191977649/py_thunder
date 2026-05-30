@@ -9,6 +9,10 @@ class Aria2RPCError(RuntimeError):
     pass
 
 
+class Aria2ConnectionError(Aria2RPCError):
+    pass
+
+
 class Aria2Client:
     def __init__(
         self,
@@ -43,21 +47,27 @@ class Aria2Client:
                 json=payload,
                 timeout=self.timeout,
             )
-            response.raise_for_status()
         except requests.RequestException as exc:
-            raise Aria2RPCError(
+            raise Aria2ConnectionError(
                 f"Failed to reach aria2 RPC at {self.endpoint}: {exc}"
             ) from exc
 
         try:
             data = response.json()
         except ValueError as exc:
-            raise Aria2RPCError("aria2 RPC returned an invalid JSON response.") from exc
+            raise Aria2ConnectionError(
+                "aria2 RPC returned an invalid JSON response."
+            ) from exc
 
         if "error" in data:
             error = data["error"]
             message = error.get("message", "Unknown aria2 RPC error")
             raise Aria2RPCError(message)
+
+        if not response.ok:
+            raise Aria2ConnectionError(
+                f"aria2 RPC returned HTTP {response.status_code} without an error payload."
+            )
 
         return data.get("result")
 
