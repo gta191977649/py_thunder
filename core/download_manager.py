@@ -54,6 +54,7 @@ class DownloadManager(QObject):
         self._aria2_online: bool | None = None
         self._last_aria2_message = ""
         self._ui_state_overrides: dict[str, TaskUiOverride] = {}
+        self._suppressed_deleted_gids: set[str] = set()
         self._piece_map_parser = Aria2ControlFileParser()
         self._piece_map_cache: dict[str, tuple[tuple[str, int, int], PieceMapSnapshot]] = {}
         self.task_list_exchange = TaskListExchangeService()
@@ -76,16 +77,20 @@ class DownloadManager(QObject):
 
         target_dir = Path(download_dir or "").expanduser()
         target_dir.mkdir(parents=True, exist_ok=True)
+        options, output_name = self._build_unique_uri_options(
+            normalized_url,
+            target_dir,
+        )
 
         try:
-            gid = self.client.add_uri([normalized_url], {"dir": str(target_dir)})
+            gid = self.client.add_uri([normalized_url], options)
             try:
                 raw_task = self.client.tell_status(gid)
                 task = aria2_dict_to_download_task(raw_task)
             except Aria2RPCError:
                 task = DownloadTask(
                     gid=gid,
-                    name=Path(urlparse(normalized_url).path).name or gid,
+                    name=output_name or Path(urlparse(normalized_url).path).name or gid,
                     url=normalized_url,
                     save_path=str(target_dir),
                     status=TaskStatus.WAITING.value,
@@ -209,6 +214,7 @@ class DownloadManager(QObject):
                 any_deleted = True
         if any_deleted:
             self._emit_persisted_tasks()
+            QTimer.singleShot(200, self.sync_tasks)
 
     def sync_tasks(self) -> None:
         if self._sync_in_progress:
@@ -218,6 +224,7 @@ class DownloadManager(QObject):
         try:
             repository_tasks = {task.gid: task for task in self.repository.list_all()}
             live_tasks = {}
+            seen_rpc_gids: set[str] = set()
             rpc_task_sets = [
                 self.client.tell_active() or [],
                 self.client.tell_waiting() or [],
@@ -226,8 +233,14 @@ class DownloadManager(QObject):
 
             for rpc_tasks in rpc_task_sets:
                 for task_data in rpc_tasks:
+                    gid = task_data.get("gid", "")
+                    if gid:
+                        seen_rpc_gids.add(gid)
+                    if gid in self._suppressed_deleted_gids:
+                        self._purge_download_result(gid)
+                        continue
                     reported_status = task_data.get("status", TaskStatus.UNKNOWN.value)
-                    existing_task = repository_tasks.get(task_data.get("gid", ""))
+                    existing_task = repository_tasks.get(gid)
                     if existing_task and existing_task.status_enum == TaskStatus.REMOVED:
                         live_tasks[existing_task.gid] = existing_task
                         continue
@@ -245,6 +258,7 @@ class DownloadManager(QObject):
             for task in repository_tasks.values():
                 self._apply_ui_override(task)
 
+            self._suppressed_deleted_gids.intersection_update(seen_rpc_gids)
             self._set_aria2_state(True)
             self.tasks_updated.emit(self.sort_tasks(repository_tasks.values()))
         except Aria2RPCError as exc:
@@ -332,12 +346,25 @@ class DownloadManager(QObject):
             QTimer.singleShot(250, self.sync_tasks)
 
     def _restore_removed_task(self, task: DownloadTask) -> None:
+        if task.completed_at or task.is_completed:
+            task.status = TaskStatus.COMPLETE.value
+            task.download_speed = 0
+            task.updated_at = utc_now_iso()
+            task.active_started_at = None
+            self.repository.upsert_from_download_task(task)
+            return
+
         if not task.url:
             raise ValueError("No task URL is available for restore.")
 
-        options = {}
-        if task.save_path:
-            options["dir"] = task.save_path
+        target_dir = Path(task.save_path).expanduser() if task.save_path else Path(".")
+        target_dir.mkdir(parents=True, exist_ok=True)
+        options, output_name = self._build_unique_uri_options(
+            task.url,
+            target_dir,
+            preferred_name=task.name,
+            exclude_gid=task.gid,
+        )
         new_gid = self.client.add_uri([task.url], options or None)
 
         self._ui_state_overrides.pop(task.gid, None)
@@ -352,9 +379,9 @@ class DownloadManager(QObject):
         except Aria2RPCError:
             restored_task = DownloadTask(
                 gid=new_gid,
-                name=task.name,
+                name=output_name or task.name,
                 url=task.url,
-                save_path=task.save_path,
+                save_path=str(target_dir),
                 status=TaskStatus.WAITING.value,
                 total_length=task.total_length,
                 completed_length=task.completed_length,
@@ -432,6 +459,9 @@ class DownloadManager(QObject):
         delete_files: bool = False,
     ) -> bool:
         try:
+            self._suppressed_deleted_gids.add(task.gid)
+            self._ui_state_overrides.pop(task.gid, None)
+            self._piece_map_cache.pop(task.gid, None)
             if task.status_enum in {
                 TaskStatus.ACTIVE,
                 TaskStatus.WAITING,
@@ -439,6 +469,7 @@ class DownloadManager(QObject):
             }:
                 self.client.remove(task.gid)
                 self._set_aria2_state(True)
+                self._purge_download_result(task.gid)
             else:
                 try:
                     self.client.remove(task.gid)
@@ -446,6 +477,7 @@ class DownloadManager(QObject):
                 except Aria2RPCError as exc:
                     if not self._is_missing_aria2_task_error(exc):
                         raise
+                self._purge_download_result(task.gid)
 
             if delete_files:
                 self.os_service.delete_task_files(task)
@@ -453,10 +485,12 @@ class DownloadManager(QObject):
             self.repository.delete_by_gid(task.gid)
             return True
         except Aria2RPCError as exc:
+            self._suppressed_deleted_gids.discard(task.gid)
             self._update_aria2_state_from_error(exc)
             self.task_error.emit(f"Unable to permanently delete task: {exc}")
             return False
         except (RuntimeError, ValueError) as exc:
+            self._suppressed_deleted_gids.discard(task.gid)
             self.task_error.emit(f"Unable to permanently delete task: {exc}")
             return False
 
@@ -476,6 +510,12 @@ class DownloadManager(QObject):
     def _update_aria2_state_from_error(self, exc: Aria2RPCError) -> None:
         if isinstance(exc, Aria2ConnectionError):
             self._set_aria2_state(False, str(exc))
+
+    def _purge_download_result(self, gid: str) -> None:
+        try:
+            self.client.remove_download_result(gid)
+        except Aria2RPCError:
+            pass
 
     def _emit_persisted_tasks(self) -> None:
         self.tasks_updated.emit(self.sort_tasks(self.repository.list_all()))
@@ -886,11 +926,14 @@ class DownloadManager(QObject):
         if not task.url:
             raise ValueError("No task URL is available for re-download.")
 
-        options = {}
-        if task.save_path:
-            target_dir = Path(task.save_path).expanduser()
-            target_dir.mkdir(parents=True, exist_ok=True)
-            options["dir"] = str(target_dir)
+        target_dir = Path(task.save_path).expanduser() if task.save_path else Path(".")
+        target_dir.mkdir(parents=True, exist_ok=True)
+        options, output_name = self._build_unique_uri_options(
+            task.url,
+            target_dir,
+            preferred_name=task.name,
+            exclude_gid=task.gid,
+        )
 
         try:
             new_gid = self.client.add_uri([task.url], options or None)
@@ -900,9 +943,9 @@ class DownloadManager(QObject):
             except Aria2RPCError:
                 new_task = DownloadTask(
                     gid=new_gid,
-                    name=task.name,
+                    name=output_name or task.name,
                     url=task.url,
-                    save_path=task.save_path,
+                    save_path=str(target_dir),
                     status=TaskStatus.WAITING.value,
                     created_at=utc_now_iso(),
                     resume_support=task.resume_support,
@@ -923,6 +966,104 @@ class DownloadManager(QObject):
             self._update_aria2_state_from_error(exc)
             self.task_error.emit(f"Unable to re-download task: {exc}")
             return None
+
+    def _build_unique_uri_options(
+        self,
+        url: str,
+        target_dir: Path,
+        *,
+        preferred_name: str | None = None,
+        exclude_gid: str | None = None,
+    ) -> tuple[dict[str, str], str | None]:
+        options = {"dir": str(target_dir)}
+        candidate_name = (
+            preferred_name or self._infer_output_name_from_url(url) or ""
+        ).strip()
+        if not candidate_name:
+            return options, None
+
+        output_name = self._make_unique_output_name(
+            target_dir,
+            candidate_name,
+            exclude_gid=exclude_gid,
+        )
+        options["out"] = output_name
+        return options, output_name
+
+    def _make_unique_output_name(
+        self,
+        target_dir: Path,
+        candidate_name: str,
+        *,
+        exclude_gid: str | None = None,
+    ) -> str:
+        if not self._output_name_conflicts(
+            target_dir,
+            candidate_name,
+            exclude_gid=exclude_gid,
+        ):
+            return candidate_name
+
+        stem, suffix = self._split_filename(candidate_name)
+        index = 2
+        while True:
+            resolved_name = f"{stem} ({index}){suffix}"
+            if not self._output_name_conflicts(
+                target_dir,
+                resolved_name,
+                exclude_gid=exclude_gid,
+            ):
+                return resolved_name
+            index += 1
+
+    def _output_name_conflicts(
+        self,
+        target_dir: Path,
+        name: str,
+        *,
+        exclude_gid: str | None = None,
+    ) -> bool:
+        file_name_key = self._filename_key(name)
+        target_dir_key = self._path_key(target_dir)
+
+        for task in self.repository.list_all():
+            if exclude_gid and task.gid == exclude_gid:
+                continue
+            if not task.name:
+                continue
+            if self._path_key(task.save_path) != target_dir_key:
+                continue
+            if self._filename_key(task.name) == file_name_key:
+                return True
+
+        target = target_dir / name
+        if target.exists() or Path(f"{target}.aria2").exists():
+            return True
+        return False
+
+    @staticmethod
+    def _infer_output_name_from_url(url: str) -> str | None:
+        parsed = urlparse(url)
+        name = Path(parsed.path).name.strip()
+        return name or None
+
+    @staticmethod
+    def _split_filename(name: str) -> tuple[str, str]:
+        suffixes = Path(name).suffixes
+        suffix = "".join(suffixes)
+        if suffix:
+            stem = name[: -len(suffix)]
+        else:
+            stem = name
+        return stem or name, suffix
+
+    @staticmethod
+    def _filename_key(name: str) -> str:
+        return name.casefold()
+
+    @staticmethod
+    def _path_key(path: str | Path) -> str:
+        return str(Path(path).expanduser()).casefold()
 
     def get_thread_runtime_view(
         self,

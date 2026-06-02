@@ -113,6 +113,9 @@ class Aria2Client:
             except Aria2RPCError:
                 raise exc
 
+    def remove_download_result(self, gid: str):
+        return self.call("removeDownloadResult", [gid])
+
     def tell_status(self, gid: str, keys: list[str] | None = None):
         params: list = [gid]
         if keys:

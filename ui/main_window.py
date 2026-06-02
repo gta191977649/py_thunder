@@ -252,6 +252,7 @@ class MainWindow(QMainWindow):
         self._install_shortcuts()
 
         self.sidebar.set_task_counts(self.all_tasks)
+        self._sync_start_action_presentation()
         self._refresh_task_view()
         self._update_global_speed_label(self.all_tasks)
         self.append_log(self.translator.t("log.ready"))
@@ -871,6 +872,7 @@ class MainWindow(QMainWindow):
             filter_key == "completed" and self.current_filter != "completed"
         )
         self.current_filter = filter_key
+        self._sync_start_action_presentation()
         self._refresh_task_view()
         self.append_log(
             self.translator.t(
@@ -1370,7 +1372,7 @@ class MainWindow(QMainWindow):
         can_pause_all = self.download_manager.can_pause_tasks(visible_tasks)
         can_remove_all = self.download_manager.can_remove_tasks(visible_tasks)
 
-        if single_completed_task:
+        if single_completed_task and self.current_filter != "trash":
             menu.addAction(
                 self._create_context_action(
                     menu,
@@ -1390,10 +1392,15 @@ class MainWindow(QMainWindow):
                 )
             )
         else:
+            start_context_key = (
+                "context.restore_task"
+                if self.current_filter == "trash"
+                else "context.start_task"
+            )
             menu.addAction(
                 self._create_context_action(
                     menu,
-                    "context.start_task",
+                    start_context_key,
                     "start",
                     self.resume_selected_task,
                     enabled=has_selection and can_start,
@@ -1518,6 +1525,16 @@ class MainWindow(QMainWindow):
         action.setEnabled(enabled)
         action.triggered.connect(handler)
         return action
+
+    def _sync_start_action_presentation(self) -> None:
+        in_trash_view = self.current_filter == "trash"
+        action_key = "action.restore" if in_trash_view else "action.start"
+        menu_key = "menu.file.restore" if in_trash_view else "menu.file.start"
+        text = self.translator.t(action_key)
+        self.start_action.setText(text)
+        self.start_action.setToolTip(text)
+        self.start_action.setStatusTip(text)
+        self.file_menu_actions.start_selected.setText(self.translator.t(menu_key))
 
     def _run_on_tasks(self, tasks: list[DownloadTask], action) -> None:
         if not tasks:

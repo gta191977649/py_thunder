@@ -135,20 +135,27 @@ class TaskTableModel(QAbstractTableModel):
                 ]
                 return values[column]
             remaining = max(task.total_length - task.completed_length, 0)
-            speed_text = (
-                "--"
-                if task.status_enum == TaskStatus.COMPLETE or task.is_completed
-                else format_speed(task.download_speed)
-            )
+            if task.status_enum == TaskStatus.REMOVED:
+                speed_text = "-"
+                eta_text = "-"
+            else:
+                speed_text = (
+                    "--"
+                    if task.status_enum == TaskStatus.COMPLETE or task.is_completed
+                    else format_speed(task.download_speed)
+                )
+                eta_text = (
+                    format_completed_at(task.completed_at)
+                    if self._completed_view
+                    else format_eta(remaining, task.download_speed)
+                )
             values = [
                 "",
                 task.name,
                 format_progress(task.progress),
                 speed_text,
                 format_bytes(task.total_length),
-                format_completed_at(task.completed_at)
-                if self._completed_view
-                else format_eta(remaining, task.download_speed),
+                eta_text,
                 self._file_type_label(task),
             ]
             return values[column]

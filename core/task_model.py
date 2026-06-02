@@ -81,11 +81,9 @@ class DownloadTask:
             return True
         if self.status_enum in {TaskStatus.ERROR, TaskStatus.FAILED}:
             return bool(self.url)
-        return (
-            self.status_enum == TaskStatus.REMOVED
-            and bool(self.url)
-            and not self.is_completed
-        )
+        if self.status_enum == TaskStatus.REMOVED:
+            return bool(self.completed_at) or self.is_completed or bool(self.url)
+        return False
 
     @property
     def can_pause(self) -> bool:
