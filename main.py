@@ -37,6 +37,7 @@ def configure_app_font(app: QApplication, base_font_size: int = 9) -> None:
 
 def main() -> int:
     app = QApplication(sys.argv)
+    app.setQuitOnLastWindowClosed(False)
     config = AppConfig.load()
     theme = load_theme()
     translator = Translator(config.language)

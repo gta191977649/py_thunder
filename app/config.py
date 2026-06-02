@@ -18,6 +18,9 @@ class AppConfig:
     max_connection_per_server: int = 16
     default_download_dir: str = ""
     language: str = "zh_CN"
+    floating_window_enabled: bool = False
+    floating_window_x: int | None = None
+    floating_window_y: int | None = None
 
     @classmethod
     def default(cls) -> "AppConfig":
@@ -46,6 +49,17 @@ class AppConfig:
             default_download_dir=data.get("default_download_dir")
             or str(get_default_download_dir()),
             language=data.get("language", "zh_CN"),
+            floating_window_enabled=bool(data.get("floating_window_enabled", False)),
+            floating_window_x=(
+                int(data["floating_window_x"])
+                if data.get("floating_window_x") is not None
+                else None
+            ),
+            floating_window_y=(
+                int(data["floating_window_y"])
+                if data.get("floating_window_y") is not None
+                else None
+            ),
         )
         Path(config.default_download_dir).mkdir(parents=True, exist_ok=True)
         config.save()

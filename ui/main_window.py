@@ -35,6 +35,7 @@ from PyQt6.QtWidgets import (
     QStatusBar,
     QStyle,
     QStyleOptionMenuItem,
+    QSystemTrayIcon,
     QTabBar,
     QTabWidget,
     QToolButton,
@@ -52,6 +53,7 @@ from core.task_model import DownloadTask, ResumeSupport, TaskStatus
 from ui.batch_task_dialog import BatchTaskDialog
 from ui.file_menu import FileMenuCallbacks, build_file_menu
 from ui.file_menu import FileMenuActions
+from ui.floating_window import FloatingWindowPresenter
 from ui.new_task_dialog import NewTaskDialog
 from ui.piece_map_widget import PieceMapWidget
 from ui.sidebar import TaskSidebar
@@ -190,6 +192,7 @@ class MainWindow(QMainWindow):
         self.all_tasks = self.download_manager.sort_tasks(initial_tasks or [])
         self.current_filter = "all"
         self._aria2_warning_shown = False
+        self._allow_app_exit = False
         self._selected_task_gids: list[str] = []
         self._known_status_by_gid: dict[str, str] = {
             task.gid: task.status for task in self.all_tasks
@@ -220,6 +223,16 @@ class MainWindow(QMainWindow):
         self.global_speed_label.setObjectName("globalSpeedLabel")
         self.global_speed_label.setFont(self.ui_font)
         self.statusBar().addPermanentWidget(self.global_speed_label)
+        self.floating_window_presenter = FloatingWindowPresenter(
+            config=self.config,
+            theme=self.theme,
+            translator=self.translator,
+            toggle_action=self.show_floating_window_action,
+            main_window=self,
+            parent=self,
+        )
+        self._setup_tray_icon()
+        self.floating_window_presenter.update_tasks(self.all_tasks)
 
         self.download_manager.tasks_updated.connect(self.on_tasks_updated)
         self.download_manager.task_error.connect(self.on_task_error)
@@ -290,11 +303,26 @@ class MainWindow(QMainWindow):
             ),
         )
 
+        menu_bar.addMenu(
+            ThunderMenu(self.theme, self.ui_font, self.translator.t("menu.edit"), menu_bar)
+        )
+
+        self.view_menu = ThunderMenu(
+            self.theme,
+            self.ui_font,
+            self.translator.t("menu.view"),
+            menu_bar,
+        )
+        menu_bar.addMenu(self.view_menu)
+        self.show_floating_window_action = QAction(
+            self.translator.t("menu.view.show_floating_window"),
+            self,
+        )
+        self.show_floating_window_action.setCheckable(True)
+        self.view_menu.addAction(self.show_floating_window_action)
+
         for key in [
-            "menu.edit",
-            "menu.view",
             "menu.settings",
-            "menu.center",
             "menu.tools",
             "menu.help",
         ]:
@@ -645,6 +673,7 @@ class MainWindow(QMainWindow):
         self._log_status_transitions(self.all_tasks)
         self._refresh_task_view()
         self._update_global_speed_label(self.all_tasks)
+        self.floating_window_presenter.update_tasks(self.all_tasks)
         self.statusBar().showMessage(
             self.translator.t("status.loaded", count=len(self.all_tasks)),
             2000,
@@ -662,6 +691,85 @@ class MainWindow(QMainWindow):
         self._aria2_warning_shown = True
         self.append_log(self.translator.t("log.aria2_unavailable", message=message))
         QMessageBox.warning(self, self.translator.t("dialog.aria2.title"), message)
+
+    def _setup_tray_icon(self) -> None:
+        self.tray_icon: QSystemTrayIcon | None = None
+        self.tray_menu: ThunderMenu | None = None
+        if not QSystemTrayIcon.isSystemTrayAvailable():
+            return
+
+        self.tray_icon = QSystemTrayIcon(self.windowIcon(), self)
+        self.tray_icon.setToolTip(self.translator.t("app.title"))
+        self.tray_menu = ThunderMenu(self.theme, self.ui_font, "", self)
+
+        self.tray_show_action = QAction(
+            self.translator.t("floating.show_main_window"),
+            self.tray_menu,
+        )
+        self.tray_exit_action = QAction(
+            self.translator.t("floating.exit_program"),
+            self.tray_menu,
+        )
+        self.tray_show_action.triggered.connect(self.show_from_tray)
+        self.tray_exit_action.triggered.connect(self.exit_from_tray)
+
+        self.tray_menu.addAction(self.tray_show_action)
+        self.tray_menu.addSeparator()
+        self.tray_menu.addAction(self.tray_exit_action)
+        self._ensure_tray_menu_width(self.tray_menu, [self.tray_show_action, self.tray_exit_action])
+
+        self.tray_icon.setContextMenu(self.tray_menu)
+        self.tray_icon.activated.connect(self._on_tray_activated)
+        self.tray_icon.show()
+
+    def _ensure_tray_menu_width(
+        self,
+        menu: ThunderMenu,
+        actions: list[QAction],
+    ) -> None:
+        font_metrics = menu.fontMetrics()
+        strip_width = self.theme_metric("context_menu_icon_strip_width", 26)
+        text_gap = self.theme_metric("context_menu_text_gap", 12)
+        right_padding = self.theme_metric("context_menu_padding_right", 14)
+        left_padding = self.theme_metric("context_menu_padding_left", 18)
+        extra_padding = 24
+
+        text_width = 0
+        for action in actions:
+            text = action.text().replace("&&", "\0").replace("&", "").replace("\0", "&")
+            text_width = max(text_width, font_metrics.horizontalAdvance(text))
+
+        minimum_width = strip_width + text_gap + left_padding + right_padding + text_width + extra_padding
+        menu.setMinimumWidth(max(minimum_width, 170))
+
+    def _on_tray_activated(self, reason: QSystemTrayIcon.ActivationReason) -> None:
+        if reason in {
+            QSystemTrayIcon.ActivationReason.Trigger,
+            QSystemTrayIcon.ActivationReason.DoubleClick,
+        }:
+            self.show_from_tray()
+
+    def show_from_tray(self) -> None:
+        self.showNormal()
+        self.raise_()
+        self.activateWindow()
+
+    def exit_from_tray(self) -> None:
+        self._allow_app_exit = True
+        if self.tray_icon is not None:
+            self.tray_icon.hide()
+        QApplication.instance().quit()
+
+    def closeEvent(self, event) -> None:
+        if not self._allow_app_exit and self.tray_icon is not None and self.tray_icon.isVisible():
+            event.ignore()
+            self.hide()
+            return
+
+        self.floating_window_presenter.shutdown()
+        if self.tray_icon is not None:
+            self.tray_icon.hide()
+        super().closeEvent(event)
 
     def on_filter_changed(self, filter_key: str) -> None:
         self.current_filter = filter_key
