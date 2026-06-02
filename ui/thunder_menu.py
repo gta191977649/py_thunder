@@ -87,6 +87,13 @@ class ThunderMenuStyle(QProxyStyle):
             )
             icon_rect.translate(icon_offset_x, icon_offset_y)
             painter.drawPixmap(icon_rect, pixmap)
+        elif option.checkType != QStyleOptionMenuItem.CheckType.NotCheckable:
+            self._draw_check_mark(
+                painter,
+                icon_strip_rect,
+                enabled=enabled,
+                checked=bool(option.checked),
+            )
 
         text_parts = option.text.split("\t", 1)
         text = text_parts[0]
@@ -143,6 +150,27 @@ class ThunderMenuStyle(QProxyStyle):
                 arrow_center_y + 4,
             )
         painter.restore()
+
+    def _draw_check_mark(
+        self,
+        painter: QPainter,
+        rect: QRect,
+        *,
+        enabled: bool,
+        checked: bool,
+    ) -> None:
+        if not checked:
+            return
+        mark_color = (
+            self._color("context_menu_text", "#082955")
+            if enabled
+            else self._color("context_menu_disabled_text", "#bcbcbc")
+        )
+        painter.setPen(QPen(mark_color, 2))
+        center_x = rect.center().x()
+        center_y = rect.center().y()
+        painter.drawLine(center_x - 5, center_y, center_x - 1, center_y + 4)
+        painter.drawLine(center_x - 1, center_y + 4, center_x + 6, center_y - 4)
 
 
 class ThunderMenu(QMenu):
@@ -236,6 +264,13 @@ class ThunderMenu(QMenu):
             icon_rect.moveTop(rect.top() + (rect.height() - icon_size) // 2)
             icon_rect.translate(icon_offset_x, icon_offset_y)
             painter.drawPixmap(icon_rect, pixmap)
+        elif action.isCheckable():
+            self._draw_check_mark(
+                painter,
+                QRect(rect.left(), rect.top(), strip_width, rect.height()),
+                enabled=enabled,
+                checked=action.isChecked(),
+            )
 
         text_font = QFont(self.font())
         text_font.setBold(False)
@@ -290,6 +325,27 @@ class ThunderMenu(QMenu):
                 arrow_center_y + 4,
             )
         painter.restore()
+
+    def _draw_check_mark(
+        self,
+        painter: QPainter,
+        rect: QRect,
+        *,
+        enabled: bool,
+        checked: bool,
+    ) -> None:
+        if not checked:
+            return
+        mark_color = (
+            self._color("context_menu_text", "#082955")
+            if enabled
+            else self._color("context_menu_disabled_text", "#bcbcbc")
+        )
+        painter.setPen(QPen(mark_color, 2))
+        center_x = rect.center().x()
+        center_y = rect.center().y()
+        painter.drawLine(center_x - 5, center_y, center_x - 1, center_y + 4)
+        painter.drawLine(center_x - 1, center_y + 4, center_x + 6, center_y - 4)
 
     def _display_text(self, text: str) -> str:
         placeholder = "\0"

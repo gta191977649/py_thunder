@@ -202,6 +202,7 @@ class FloatingWindowView(QWidget):
     close_requested = pyqtSignal()
     exit_requested = pyqtSignal()
     show_main_window_requested = pyqtSignal()
+    toggle_main_window_requested = pyqtSignal()
     moved = pyqtSignal(QPoint)
 
     def __init__(self, theme: dict, font: QFont, translator: Translator) -> None:
@@ -219,6 +220,7 @@ class FloatingWindowView(QWidget):
         self._speed_history: list[int] = []
         self._tooltip_items: list[FloatingTaskTooltipItem] = []
         self._active = False
+        self._main_window_visible = True
         self._drag_offset: QPoint | None = None
         self._idle_pixmap = QPixmap(
             str(get_thunder5_icons_dir() / "float_window" / "166.bmp")
@@ -307,6 +309,9 @@ class FloatingWindowView(QWidget):
             return
         if self._should_keep_tooltip_visible():
             self._show_task_tooltip()
+
+    def set_main_window_visible(self, visible: bool) -> None:
+        self._main_window_visible = bool(visible)
 
     def paintEvent(self, event) -> None:
         del event
@@ -521,10 +526,15 @@ class FloatingWindowView(QWidget):
 
     def contextMenuEvent(self, event) -> None:
         menu = ThunderMenu(self.theme, self.font(), "", self)
-        show_action = QAction(self.translator.t("floating.show_main_window"), menu)
+        main_window_text = self.translator.t(
+            "floating.hide_main_window"
+            if self._main_window_visible
+            else "floating.show_main_window"
+        )
+        show_action = QAction(main_window_text, menu)
         close_action = QAction(self.translator.t("floating.close"), menu)
         exit_action = QAction(self.translator.t("floating.exit_program"), menu)
-        show_action.triggered.connect(self.show_main_window_requested.emit)
+        show_action.triggered.connect(self.toggle_main_window_requested.emit)
         close_action.triggered.connect(self.close_requested.emit)
         exit_action.triggered.connect(self.exit_requested.emit)
         menu.addAction(show_action)
@@ -680,9 +690,11 @@ class FloatingWindowPresenter(QObject):
         self.view.close_requested.connect(lambda: self.set_enabled(False))
         self.view.exit_requested.connect(self._exit_application)
         self.view.show_main_window_requested.connect(self._show_main_window)
+        self.view.toggle_main_window_requested.connect(self._toggle_main_window)
         self.view.moved.connect(self._save_position)
 
         self._sync_action()
+        self._sync_main_window_visibility()
         self._sync_view_visibility(persist=False)
 
     def update_tasks(self, tasks: list[DownloadTask]) -> None:
@@ -775,6 +787,19 @@ class FloatingWindowPresenter(QObject):
         self.main_window.showNormal()
         self.main_window.raise_()
         self.main_window.activateWindow()
+        self._sync_main_window_visibility()
+
+    def _toggle_main_window(self) -> None:
+        toggle_handler = getattr(self.main_window, "toggle_main_window_visibility", None)
+        if callable(toggle_handler):
+            toggle_handler()
+            return
+
+        if self._is_main_window_visible():
+            self.main_window.hide()
+        else:
+            self._show_main_window()
+        self._sync_main_window_visibility()
 
     def _exit_application(self) -> None:
         exit_handler = getattr(self.main_window, "exit_from_tray", None)
@@ -784,6 +809,12 @@ class FloatingWindowPresenter(QObject):
         app = QApplication.instance()
         if app is not None:
             app.quit()
+
+    def _is_main_window_visible(self) -> bool:
+        return self.main_window.isVisible() and not self.main_window.isMinimized()
+
+    def _sync_main_window_visibility(self) -> None:
+        self.view.set_main_window_visible(self._is_main_window_visible())
 
     def _calculate_progress_percent(self, live_tasks: list[DownloadTask]) -> float:
         total_length = 0

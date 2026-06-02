@@ -695,6 +695,8 @@ class MainWindow(QMainWindow):
     def _setup_tray_icon(self) -> None:
         self.tray_icon: QSystemTrayIcon | None = None
         self.tray_menu: ThunderMenu | None = None
+        self.tray_show_action: QAction | None = None
+        self.tray_exit_action: QAction | None = None
         if not QSystemTrayIcon.isSystemTrayAvailable():
             return
 
@@ -710,7 +712,7 @@ class MainWindow(QMainWindow):
             self.translator.t("floating.exit_program"),
             self.tray_menu,
         )
-        self.tray_show_action.triggered.connect(self.show_from_tray)
+        self.tray_show_action.triggered.connect(self.toggle_main_window_visibility)
         self.tray_exit_action.triggered.connect(self.exit_from_tray)
 
         self.tray_menu.addAction(self.tray_show_action)
@@ -721,6 +723,7 @@ class MainWindow(QMainWindow):
         self.tray_icon.setContextMenu(self.tray_menu)
         self.tray_icon.activated.connect(self._on_tray_activated)
         self.tray_icon.show()
+        self._sync_window_toggle_actions()
 
     def _ensure_tray_menu_width(
         self,
@@ -747,12 +750,38 @@ class MainWindow(QMainWindow):
             QSystemTrayIcon.ActivationReason.Trigger,
             QSystemTrayIcon.ActivationReason.DoubleClick,
         }:
-            self.show_from_tray()
+            self.toggle_main_window_visibility()
 
     def show_from_tray(self) -> None:
         self.showNormal()
         self.raise_()
         self.activateWindow()
+        self._sync_window_toggle_actions()
+
+    def _is_main_window_presented(self) -> bool:
+        return self.isVisible() and not self.isMinimized()
+
+    def toggle_main_window_visibility(self) -> None:
+        if self._is_main_window_presented():
+            self.hide()
+        else:
+            self.show_from_tray()
+        self._sync_window_toggle_actions()
+
+    def _sync_window_toggle_actions(self) -> None:
+        is_visible = self._is_main_window_presented()
+        if self.tray_show_action is not None:
+            self.tray_show_action.setText(
+                self.translator.t(
+                    "floating.hide_main_window"
+                    if is_visible
+                    else "floating.show_main_window"
+                )
+            )
+
+        presenter = getattr(self, "floating_window_presenter", None)
+        if presenter is not None:
+            presenter._sync_main_window_visibility()
 
     def exit_from_tray(self) -> None:
         self._allow_app_exit = True
@@ -764,12 +793,21 @@ class MainWindow(QMainWindow):
         if not self._allow_app_exit and self.tray_icon is not None and self.tray_icon.isVisible():
             event.ignore()
             self.hide()
+            self._sync_window_toggle_actions()
             return
 
         self.floating_window_presenter.shutdown()
         if self.tray_icon is not None:
             self.tray_icon.hide()
         super().closeEvent(event)
+
+    def showEvent(self, event) -> None:
+        super().showEvent(event)
+        self._sync_window_toggle_actions()
+
+    def hideEvent(self, event) -> None:
+        super().hideEvent(event)
+        self._sync_window_toggle_actions()
 
     def on_filter_changed(self, filter_key: str) -> None:
         self.current_filter = filter_key
