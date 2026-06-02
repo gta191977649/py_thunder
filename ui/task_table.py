@@ -27,7 +27,13 @@ from PyQt6.QtWidgets import (
 
 from app.i18n import Translator
 from app.paths import get_thunder5_icons_dir
-from core.formatters import format_bytes, format_eta, format_progress, format_speed
+from core.formatters import (
+    format_bytes,
+    format_completed_at,
+    format_eta,
+    format_progress,
+    format_speed,
+)
 from core.task_model import DownloadTask, TaskStatus
 
 
@@ -63,6 +69,15 @@ class TaskTableModel(QAbstractTableModel):
         "table.eta",
         "table.file_type",
     ]
+    COMPLETED_HEADER_KEYS = [
+        "table.status",
+        "table.name",
+        "table.progress",
+        "table.speed",
+        "table.size",
+        "table.completed_at",
+        "table.file_type",
+    ]
 
     def __init__(
         self,
@@ -78,6 +93,7 @@ class TaskTableModel(QAbstractTableModel):
         self._rows: list[TaskTableRow] = []
         self._sort_column: int | None = None
         self._sort_order = Qt.SortOrder.AscendingOrder
+        self._completed_view = False
         self._file_icon_provider = QFileIconProvider()
         self._file_icons_by_type: dict[str, QIcon] = {}
         icons_dir = get_thunder5_icons_dir() / "task_status"
@@ -130,7 +146,9 @@ class TaskTableModel(QAbstractTableModel):
                 format_progress(task.progress),
                 speed_text,
                 format_bytes(task.total_length),
-                format_eta(remaining, task.download_speed),
+                format_completed_at(task.completed_at)
+                if self._completed_view
+                else format_eta(remaining, task.download_speed),
                 self._file_type_label(task),
             ]
             return values[column]
@@ -188,6 +206,8 @@ class TaskTableModel(QAbstractTableModel):
                 return row_entry.connection.label if row_entry.connection else ""
             if column == 0:
                 return self.translator.status_label(task.status)
+            if column == 5 and self._completed_view:
+                return format_completed_at(task.completed_at)
             return self._file_type_label(task) if column == 6 else task.name
 
         return None
@@ -201,8 +221,21 @@ class TaskTableModel(QAbstractTableModel):
         if role != Qt.ItemDataRole.DisplayRole:
             return None
         if orientation == Qt.Orientation.Horizontal:
-            return self.translator.t(self.HEADER_KEYS[section])
+            header_keys = (
+                self.COMPLETED_HEADER_KEYS if self._completed_view else self.HEADER_KEYS
+            )
+            return self.translator.t(header_keys[section])
         return str(section + 1)
+
+    def set_completed_view(self, enabled: bool) -> None:
+        enabled = bool(enabled)
+        if self._completed_view == enabled:
+            return
+        self.beginResetModel()
+        self._completed_view = enabled
+        self._apply_task_sort()
+        self._rebuild_rows()
+        self.endResetModel()
 
     def set_tasks(
         self,
@@ -256,6 +289,8 @@ class TaskTableModel(QAbstractTableModel):
         if column == 4:
             return int(task.total_length or 0)
         if column == 5:
+            if self._completed_view:
+                return task.completed_at or ""
             remaining = max(task.total_length - task.completed_length, 0)
             if task.status_enum == TaskStatus.COMPLETE or task.is_completed:
                 return 0.0
@@ -696,6 +731,19 @@ class TaskTableView(QTableView):
         self.setColumnWidth(4, int(metrics.get("column_size_width", 108)))
         self.setColumnWidth(5, int(metrics.get("column_eta_width", 120)))
         self.setColumnWidth(6, int(metrics.get("column_file_type_width", 120)))
+
+    def apply_default_sort_for_completed_view(self, enabled: bool) -> None:
+        column = 5
+        order = Qt.SortOrder.DescendingOrder if enabled else Qt.SortOrder.AscendingOrder
+        if enabled:
+            self._sort_column = column
+            self._sort_order = order
+            model = self.model()
+            if isinstance(model, TaskTableModel):
+                model.sort(column, order)
+            header = self.horizontalHeader()
+            if isinstance(header, TaskHeaderView):
+                header.set_task_sort_indicator(column, order)
 
     def select_all_task_rows(self) -> None:
         model = self.model()

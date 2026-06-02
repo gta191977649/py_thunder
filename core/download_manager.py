@@ -507,9 +507,12 @@ class DownloadManager(QObject):
             TaskStatus.REMOVED: 5,
             TaskStatus.UNKNOWN: 6,
         }.get(task.status_enum, 6)
-        created_at = parse_iso_datetime(task.created_at)
-        created_ts = created_at.timestamp() if created_at else 0.0
-        return status_rank, -created_ts, task.gid
+        if task.status_enum == TaskStatus.COMPLETE:
+            sort_dt = parse_iso_datetime(task.completed_at) or parse_iso_datetime(task.updated_at)
+        else:
+            sort_dt = parse_iso_datetime(task.created_at)
+        sort_ts = sort_dt.timestamp() if sort_dt else 0.0
+        return status_rank, -sort_ts, task.gid
 
     def filter_tasks(
         self,
@@ -825,15 +828,21 @@ class DownloadManager(QObject):
         task: DownloadTask,
     ) -> None:
         if existing_task is None:
+            if task.status_enum == TaskStatus.COMPLETE and not task.completed_at:
+                task.completed_at = utc_now_iso()
             if task.status_enum == TaskStatus.ACTIVE:
                 task.active_started_at = task.created_at or utc_now_iso()
             return
 
         task.elapsed_seconds = int(existing_task.elapsed_seconds or 0)
         task.active_started_at = existing_task.active_started_at
+        task.completed_at = existing_task.completed_at
 
         previous_status = existing_task.status_enum
         current_status = task.status_enum
+
+        if previous_status != TaskStatus.COMPLETE and current_status == TaskStatus.COMPLETE:
+            task.completed_at = task.completed_at or utc_now_iso()
 
         if previous_status != TaskStatus.ACTIVE and current_status == TaskStatus.ACTIVE:
             task.active_started_at = utc_now_iso()

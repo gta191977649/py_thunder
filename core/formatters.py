@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+from datetime import datetime, timezone
 
 
 def format_bytes(value: int) -> str:
@@ -51,3 +52,16 @@ def format_duration(total_seconds: int) -> str:
     hours, remainder = divmod(total_seconds, 3600)
     minutes, seconds = divmod(remainder, 60)
     return f"{hours:02d}:{minutes:02d}:{seconds:02d}"
+
+
+def format_completed_at(value: str | None) -> str:
+    if not value:
+        return "--"
+    try:
+        parsed = datetime.fromisoformat(value)
+    except ValueError:
+        return "--"
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    local_dt = parsed.astimezone()
+    return local_dt.strftime("%Y-%m-%d %H:%M:%S")

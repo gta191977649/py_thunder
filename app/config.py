@@ -5,7 +5,11 @@ import secrets
 from dataclasses import asdict, dataclass
 from pathlib import Path
 
-from app.paths import get_config_path, get_default_download_dir
+from app.paths import (
+    get_config_path,
+    get_default_download_dir,
+    get_default_notification_sound_path,
+)
 
 
 @dataclass(slots=True)
@@ -21,6 +25,8 @@ class AppConfig:
     floating_window_enabled: bool = False
     floating_window_x: int | None = None
     floating_window_y: int | None = None
+    notification_sound_enabled: bool = True
+    notification_sound_path: str = ""
 
     @classmethod
     def default(cls) -> "AppConfig":
@@ -28,6 +34,7 @@ class AppConfig:
             rpc_secret=secrets.token_hex(16),
             default_download_dir=str(get_default_download_dir()),
             language="zh_CN",
+            notification_sound_path=str(get_default_notification_sound_path()),
         )
 
     @classmethod
@@ -59,6 +66,10 @@ class AppConfig:
                 int(data["floating_window_y"])
                 if data.get("floating_window_y") is not None
                 else None
+            ),
+            notification_sound_enabled=bool(data.get("notification_sound_enabled", True)),
+            notification_sound_path=(
+                str(data.get("notification_sound_path") or get_default_notification_sound_path())
             ),
         )
         Path(config.default_download_dir).mkdir(parents=True, exist_ok=True)

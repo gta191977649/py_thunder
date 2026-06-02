@@ -1,9 +1,12 @@
 from __future__ import annotations
 
-
 class Translator:
     DEFAULT_LANGUAGE = "zh_CN"
     FALLBACK_LANGUAGE = "en_US"
+    LANGUAGE_LABELS = {
+        "zh_CN": "中文（简体）",
+        "en_US": "English",
+    }
 
     TRANSLATIONS = {
         "zh_CN": {
@@ -31,6 +34,7 @@ class Translator:
             "menu.file.exit": "退出(&X)",
             "menu.edit": "编辑(&E)",
             "menu.view": "查看(&V)",
+            "menu.language": "语言(&L)",
             "menu.view.show_floating_window": "显示悬浮窗(&F)",
             "menu.settings": "常用设置(&S)",
             "menu.tools": "工具(&T)",
@@ -85,6 +89,7 @@ class Translator:
             "table.progress": "进度",
             "table.speed": "速度",
             "table.eta": "剩余时间",
+            "table.completed_at": "完成时间",
             "table.status": "状态",
             "table.file_type": "文件类型",
             "file_type.bt_task": "BT任务",
@@ -179,6 +184,7 @@ class Translator:
             "info.task_progress": "进度：{progress}",
             "info.task_size": "大小：{size}",
             "info.task_elapsed": "用时：{value}",
+            "info.task_completed_at": "完成时间：{value}",
             "info.task_resume_support": "断点续传：{value}",
             "info.resume_support_yes": "是",
             "info.resume_support_no": "否",
@@ -220,6 +226,7 @@ class Translator:
             "menu.file.exit": "Exit",
             "menu.edit": "Edit",
             "menu.view": "View",
+            "menu.language": "Language",
             "menu.view.show_floating_window": "Show Floating Window",
             "menu.settings": "Settings",
             "menu.tools": "Tools",
@@ -274,6 +281,7 @@ class Translator:
             "table.progress": "Progress",
             "table.speed": "Speed",
             "table.eta": "ETA",
+            "table.completed_at": "Completed At",
             "table.status": "Status",
             "table.file_type": "File Type",
             "file_type.bt_task": "BT Task",
@@ -368,6 +376,7 @@ class Translator:
             "info.task_progress": "Progress: {progress}",
             "info.task_size": "Size: {size}",
             "info.task_elapsed": "Elapsed: {value}",
+            "info.task_completed_at": "Completed At: {value}",
             "info.task_resume_support": "Resume Support: {value}",
             "info.resume_support_yes": "Yes",
             "info.resume_support_no": "No",
@@ -388,6 +397,14 @@ class Translator:
 
     def __init__(self, language: str = DEFAULT_LANGUAGE) -> None:
         self.language = language if language in self.TRANSLATIONS else self.DEFAULT_LANGUAGE
+
+    @classmethod
+    def available_languages(cls) -> list[str]:
+        return sorted(cls.TRANSLATIONS.keys())
+
+    @classmethod
+    def language_label(cls, language_code: str) -> str:
+        return cls.LANGUAGE_LABELS.get(language_code, language_code)
 
     def t(self, key: str, **kwargs) -> str:
         value = self.TRANSLATIONS.get(self.language, {}).get(key)

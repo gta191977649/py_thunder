@@ -221,6 +221,10 @@ class NewTaskDialog(QDialog):
             QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel,
             parent=self,
         )
+        ok_button = button_box.button(QDialogButtonBox.StandardButton.Ok)
+        if ok_button is not None:
+            ok_button.setDefault(True)
+            ok_button.setAutoDefault(True)
         button_box.accepted.connect(self.accept)
         button_box.rejected.connect(self.reject)
 

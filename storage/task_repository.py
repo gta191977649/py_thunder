@@ -85,7 +85,7 @@ class TaskRepository:
                     download_speed = excluded.download_speed,
                     error_message = excluded.error_message,
                     updated_at = excluded.updated_at,
-                    completed_at = COALESCE(excluded.completed_at, tasks.completed_at),
+                    completed_at = COALESCE(tasks.completed_at, excluded.completed_at),
                     resume_support = COALESCE(excluded.resume_support, tasks.resume_support),
                     elapsed_seconds = excluded.elapsed_seconds,
                     active_started_at = excluded.active_started_at
@@ -119,7 +119,12 @@ class TaskRepository:
                        updated_at, completed_at, error_message, resume_support,
                        elapsed_seconds, active_started_at
                 FROM tasks
-                ORDER BY datetime(created_at) DESC, id DESC
+                ORDER BY
+                    CASE
+                        WHEN status = 'complete' THEN datetime(completed_at)
+                        ELSE datetime(created_at)
+                    END DESC,
+                    id DESC
                 """
             ).fetchall()
         return [self._row_to_task(row) for row in rows]

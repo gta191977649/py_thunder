@@ -28,6 +28,14 @@ def get_thunder5_icons_dir() -> Path:
     return get_icons_dir() / "thunder5"
 
 
+def get_sfx_dir() -> Path:
+    return get_resources_dir() / "sfx"
+
+
+def get_default_notification_sound_path() -> Path:
+    return get_sfx_dir() / "notification.wav"
+
+
 def get_platform_key() -> str:
     if sys.platform.startswith("win"):
         return "win"

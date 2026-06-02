@@ -3,7 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 from urllib.parse import urlparse
 
-from core.task_model import DownloadTask, TaskStatus, utc_now_iso
+from core.task_model import DownloadTask, TaskStatus
 
 
 def extract_task_url(task_data: dict) -> str:
@@ -47,7 +47,6 @@ def extract_task_name(task_data: dict) -> str:
 
 def aria2_dict_to_download_task(task_data: dict) -> DownloadTask:
     status = task_data.get("status", TaskStatus.UNKNOWN.value)
-    completed_at = utc_now_iso() if status == TaskStatus.COMPLETE.value else None
     download_speed = int(task_data.get("downloadSpeed", 0) or 0)
     if status == TaskStatus.PAUSED.value:
         # aria2 may briefly report a decaying speed after pause; keep paused UI stable.
@@ -62,7 +61,7 @@ def aria2_dict_to_download_task(task_data: dict) -> DownloadTask:
         total_length=int(task_data.get("totalLength", 0) or 0),
         completed_length=int(task_data.get("completedLength", 0) or 0),
         download_speed=download_speed,
-        completed_at=completed_at,
+        completed_at=None,
         error_message=task_data.get("errorMessage"),
         elapsed_seconds=0,
         active_started_at=None,

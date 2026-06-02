@@ -1,14 +1,16 @@
 from __future__ import annotations
 
+import sys
 import threading
 from datetime import datetime
 from pathlib import Path
 from urllib.parse import urlparse
 
 import requests
-from PyQt6.QtCore import QPoint, QRect, QSize, QSignalBlocker, Qt, pyqtSignal
+from PyQt6.QtCore import QPoint, QProcess, QRect, QSize, QSignalBlocker, Qt, pyqtSignal
 from PyQt6.QtGui import (
     QAction,
+    QActionGroup,
     QColor,
     QKeySequence,
     QFont,
@@ -47,7 +49,13 @@ from app.config import AppConfig
 from app.i18n import Translator
 from app.paths import get_thunder5_icons_dir
 from core.download_manager import DownloadManager
-from core.formatters import format_bytes, format_duration, format_progress, format_speed
+from core.formatters import (
+    format_bytes,
+    format_completed_at,
+    format_duration,
+    format_progress,
+    format_speed,
+)
 from core.piece_map import PieceMapSnapshot
 from core.task_model import DownloadTask, ResumeSupport, TaskStatus
 from ui.batch_task_dialog import BatchTaskDialog
@@ -60,6 +68,7 @@ from ui.sidebar import TaskSidebar
 from ui.task_table import TaskTableModel, TaskTableView
 from ui.thunder_menu import ThunderMenu, ThunderMenuStyle
 from ui.themed_checkbox import ThemedCheckBox
+from services.notification_sound import NotificationSoundPlayer
 
 
 class RuntimeTabBar(QTabBar):
@@ -191,6 +200,7 @@ class MainWindow(QMainWindow):
         self.download_manager = download_manager
         self.all_tasks = self.download_manager.sort_tasks(initial_tasks or [])
         self.current_filter = "all"
+        self._apply_completed_default_sort_on_refresh = False
         self._aria2_warning_shown = False
         self._allow_app_exit = False
         self._selected_task_gids: list[str] = []
@@ -204,6 +214,7 @@ class MainWindow(QMainWindow):
         }
         self._resume_support_pending: set[str] = set()
         self.ui_font = self._make_ui_font(int(self.theme_metric("base_font_size", 9)))
+        self.notification_sound_player = NotificationSoundPlayer(self.config, self)
 
         self.setWindowTitle(self.translator.t("app.title"))
         self.setWindowIcon(QIcon(str(get_thunder5_icons_dir() / "app_icon.png")))
@@ -324,9 +335,55 @@ class MainWindow(QMainWindow):
         for key in [
             "menu.settings",
             "menu.tools",
-            "menu.help",
         ]:
             menu_bar.addMenu(ThunderMenu(self.theme, self.ui_font, self.translator.t(key), menu_bar))
+
+        self.language_menu = ThunderMenu(
+            self.theme,
+            self.ui_font,
+            self.translator.t("menu.language"),
+            menu_bar,
+        )
+        menu_bar.addMenu(self.language_menu)
+        self._build_language_menu()
+
+        menu_bar.addMenu(
+            ThunderMenu(self.theme, self.ui_font, self.translator.t("menu.help"), menu_bar)
+        )
+
+    def _build_language_menu(self) -> None:
+        self.language_action_group = QActionGroup(self)
+        self.language_action_group.setExclusive(True)
+
+        for language_code in Translator.available_languages():
+            action = QAction(Translator.language_label(language_code), self.language_menu)
+            action.setCheckable(True)
+            action.setChecked(language_code == self.config.language)
+            action.triggered.connect(
+                lambda checked=False, code=language_code: self._change_language(code)
+            )
+            self.language_action_group.addAction(action)
+            self.language_menu.addAction(action)
+
+    def _change_language(self, language_code: str) -> None:
+        if language_code == self.config.language:
+            return
+        self.config.language = language_code
+        self.config.save()
+        self._restart_application()
+
+    def _restart_application(self) -> None:
+        if getattr(sys, "frozen", False):
+            program = sys.executable
+            arguments = sys.argv[1:]
+        else:
+            program = sys.executable
+            arguments = sys.argv
+
+        started_result = QProcess.startDetached(program, arguments)
+        started = started_result[0] if isinstance(started_result, tuple) else bool(started_result)
+        if started:
+            self.exit_from_tray()
 
     def _install_shortcuts(self) -> None:
         self.task_table.remove_requested.connect(self.remove_selected_task)
@@ -810,6 +867,9 @@ class MainWindow(QMainWindow):
         self._sync_window_toggle_actions()
 
     def on_filter_changed(self, filter_key: str) -> None:
+        self._apply_completed_default_sort_on_refresh = (
+            filter_key == "completed" and self.current_filter != "completed"
+        )
         self.current_filter = filter_key
         self._refresh_task_view()
         self.append_log(
@@ -1212,6 +1272,7 @@ class MainWindow(QMainWindow):
         selected_gids = list(self._selected_task_gids)
         vertical_scroll = self.task_table.verticalScrollBar().value()
         horizontal_scroll = self.task_table.horizontalScrollBar().value()
+        completed_view = self.current_filter == "completed"
         filtered_tasks = self._filtered_tasks()
         thread_rows_by_gid: dict[str, list] = {}
         for task in filtered_tasks:
@@ -1221,7 +1282,11 @@ class MainWindow(QMainWindow):
             )
             if len(thread_rows) > 1:
                 thread_rows_by_gid[task.gid] = thread_rows
+        self.task_model.set_completed_view(completed_view)
         self.task_model.set_tasks(filtered_tasks, thread_rows_by_gid)
+        if self._apply_completed_default_sort_on_refresh and completed_view:
+            self.task_table.apply_default_sort_for_completed_view(True)
+            self._apply_completed_default_sort_on_refresh = False
         self._restore_selection(selected_gids, scroll_to_current=False)
         self.task_table.verticalScrollBar().setValue(vertical_scroll)
         self.task_table.horizontalScrollBar().setValue(horizontal_scroll)
@@ -1510,7 +1575,7 @@ class MainWindow(QMainWindow):
         message_box.setStandardButtons(
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
         )
-        message_box.setDefaultButton(QMessageBox.StandardButton.No)
+        message_box.setDefaultButton(QMessageBox.StandardButton.Yes)
 
         checkbox = ThemedCheckBox(
             self.translator.t("dialog.delete_permanent.files"),
@@ -1578,16 +1643,36 @@ class MainWindow(QMainWindow):
         )
 
     def _task_summary_text(self, task: DownloadTask) -> str:
-        return self.translator.t(
-            "info.properties_body",
-            name=task.name,
-            status=self.translator.status_label(task.status),
-            progress=format_progress(task.progress),
-            size=format_bytes(task.total_length),
-            elapsed=format_duration(task.current_elapsed_seconds()),
-            path=task.save_path or "-",
-            url=task.url or "-",
+        lines = [
+            self.translator.t("info.task_name", name=task.name),
+            self.translator.t(
+                "info.task_status",
+                status=self.translator.status_label(task.status),
+            ),
+            self.translator.t(
+                "info.task_progress",
+                progress=format_progress(task.progress),
+            ),
+            self.translator.t("info.task_size", size=format_bytes(task.total_length)),
+            self.translator.t(
+                "info.task_elapsed",
+                value=format_duration(task.current_elapsed_seconds()),
+            ),
+        ]
+        if task.status_enum == TaskStatus.COMPLETE and task.completed_at:
+            lines.append(
+                self.translator.t(
+                    "info.task_completed_at",
+                    value=format_completed_at(task.completed_at),
+                )
+            )
+        lines.extend(
+            [
+                self.translator.t("info.task_save_path", path=task.save_path or "-"),
+                self.translator.t("info.task_url", url=task.url or "-"),
+            ]
         )
+        return "\n".join(lines)
 
     def _update_action_states(self) -> None:
         selected_tasks = self._selected_tasks()
@@ -1683,10 +1768,21 @@ class MainWindow(QMainWindow):
                 "info.task_elapsed",
                 value=format_duration(task.current_elapsed_seconds()),
             ),
-            self.translator.t("info.task_resume_support", value=resume_support_text),
-            self.translator.t("info.task_save_path", path=task.save_path or "-"),
-            self.translator.t("info.task_url", url=task.url or "-"),
         ]
+        if task.status_enum == TaskStatus.COMPLETE and task.completed_at:
+            lines.append(
+                self.translator.t(
+                    "info.task_completed_at",
+                    value=format_completed_at(task.completed_at),
+                )
+            )
+        lines.extend(
+            [
+                self.translator.t("info.task_resume_support", value=resume_support_text),
+                self.translator.t("info.task_save_path", path=task.save_path or "-"),
+                self.translator.t("info.task_url", url=task.url or "-"),
+            ]
+        )
         self.task_info_label.setText("\n".join(lines))
         self._update_piece_map_for_task(task)
         thread_count, thread_lines = self.download_manager.get_thread_runtime_view(
@@ -1809,6 +1905,8 @@ class MainWindow(QMainWindow):
                         status=self.translator.status_label(task.status),
                     )
                 )
+                if task.status_enum == TaskStatus.COMPLETE:
+                    self.notification_sound_player.play_download_complete()
                 self._known_status_by_gid[task.gid] = task.status
 
     def append_log(self, message: str) -> None:
