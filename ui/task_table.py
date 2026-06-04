@@ -102,7 +102,11 @@ class TaskTableModel(QAbstractTableModel):
             for status in TaskStatus
             if (icons_dir / f"{status.value}.png").exists()
         }
-        self._rebuild_rows()
+        self._rows = self._build_rows(
+            self._tasks,
+            self._thread_rows_by_gid,
+            self._expanded_gids,
+        )
 
     def rowCount(self, parent=QModelIndex()) -> int:
         if parent.isValid():
@@ -241,7 +245,11 @@ class TaskTableModel(QAbstractTableModel):
         self.beginResetModel()
         self._completed_view = enabled
         self._apply_task_sort()
-        self._rebuild_rows()
+        self._rows = self._build_rows(
+            self._tasks,
+            self._thread_rows_by_gid,
+            self._expanded_gids,
+        )
         self.endResetModel()
 
     def set_tasks(
@@ -257,8 +265,59 @@ class TaskTableModel(QAbstractTableModel):
         valid_task_gids = {task.gid for task in self._tasks}
         self._expanded_gids.intersection_update(valid_task_gids)
         self._apply_task_sort()
-        self._rebuild_rows()
+        self._rows = self._build_rows(
+            self._tasks,
+            self._thread_rows_by_gid,
+            self._expanded_gids,
+        )
         self.endResetModel()
+
+    def refresh_tasks(
+        self,
+        tasks: list[DownloadTask],
+        thread_rows_by_gid: dict[str, list[TaskConnectionRow]] | None = None,
+        *,
+        completed_view: bool,
+    ) -> None:
+        next_tasks = list(tasks)
+        next_thread_rows_by_gid = {
+            gid: list(rows) for gid, rows in (thread_rows_by_gid or {}).items()
+        }
+        next_completed_view = bool(completed_view)
+        next_expanded_gids = self._expanded_gids.intersection(
+            {task.gid for task in next_tasks}
+        )
+
+        self._sort_tasks_in_place(next_tasks, completed_view=next_completed_view)
+        next_rows = self._build_rows(
+            next_tasks,
+            next_thread_rows_by_gid,
+            next_expanded_gids,
+        )
+        structure_changed = (
+            self._completed_view != next_completed_view
+            or self._row_structure_signature(self._rows)
+            != self._row_structure_signature(next_rows)
+        )
+
+        if structure_changed:
+            self.beginResetModel()
+
+        self._tasks = next_tasks
+        self._thread_rows_by_gid = next_thread_rows_by_gid
+        self._expanded_gids = next_expanded_gids
+        self._completed_view = next_completed_view
+        self._rows = next_rows
+
+        if structure_changed:
+            self.endResetModel()
+            return
+
+        if self._rows:
+            self.dataChanged.emit(
+                self.index(0, 0),
+                self.index(len(self._rows) - 1, self.columnCount() - 1),
+            )
 
     def sort(
         self,
@@ -271,20 +330,42 @@ class TaskTableModel(QAbstractTableModel):
         self._sort_order = order
         self.beginResetModel()
         self._apply_task_sort()
-        self._rebuild_rows()
+        self._rows = self._build_rows(
+            self._tasks,
+            self._thread_rows_by_gid,
+            self._expanded_gids,
+        )
         self.endResetModel()
 
     def _apply_task_sort(self) -> None:
+        self._sort_tasks_in_place(self._tasks, completed_view=self._completed_view)
+
+    def _sort_tasks_in_place(
+        self,
+        tasks: list[DownloadTask],
+        *,
+        completed_view: bool,
+    ) -> None:
         if self._sort_column is None:
             return
 
-        self._tasks.sort(key=lambda task: (task.created_at or "", task.gid), reverse=True)
-        self._tasks.sort(
-            key=lambda task: self._sort_value(task, self._sort_column or 0),
+        tasks.sort(key=lambda task: (task.created_at or "", task.gid), reverse=True)
+        tasks.sort(
+            key=lambda task: self._sort_value(
+                task,
+                self._sort_column or 0,
+                completed_view=completed_view,
+            ),
             reverse=self._sort_order == Qt.SortOrder.DescendingOrder,
         )
 
-    def _sort_value(self, task: DownloadTask, column: int):
+    def _sort_value(
+        self,
+        task: DownloadTask,
+        column: int,
+        *,
+        completed_view: bool,
+    ):
         if column == 0:
             return self._status_sort_rank(task)
         if column == 1:
@@ -296,7 +377,7 @@ class TaskTableModel(QAbstractTableModel):
         if column == 4:
             return int(task.total_length or 0)
         if column == 5:
-            if self._completed_view:
+            if completed_view:
                 return task.completed_at or ""
             remaining = max(task.total_length - task.completed_length, 0)
             if task.status_enum == TaskStatus.COMPLETE or task.is_completed:
@@ -335,16 +416,38 @@ class TaskTableModel(QAbstractTableModel):
         return None
 
     def _rebuild_rows(self) -> None:
+        self._rows = self._build_rows(
+            self._tasks,
+            self._thread_rows_by_gid,
+            self._expanded_gids,
+        )
+
+    def _build_rows(
+        self,
+        tasks: list[DownloadTask],
+        thread_rows_by_gid: dict[str, list[TaskConnectionRow]],
+        expanded_gids: set[str],
+    ) -> list[TaskTableRow]:
         rows: list[TaskTableRow] = []
-        for task in self._tasks:
+        for task in tasks:
             rows.append(TaskTableRow(task=task))
-            thread_rows = self._thread_rows_by_gid.get(task.gid) or []
-            if task.gid in self._expanded_gids and len(thread_rows) > 1:
+            thread_rows = thread_rows_by_gid.get(task.gid) or []
+            if task.gid in expanded_gids and len(thread_rows) > 1:
                 rows.extend(
                     TaskTableRow(task=task, connection=thread_row)
                     for thread_row in thread_rows
                 )
-        self._rows = rows
+        return rows
+
+    @staticmethod
+    def _row_structure_signature(rows: list[TaskTableRow]) -> list[tuple[str, str]]:
+        return [
+            (
+                row.task.gid,
+                row.connection.label if row.connection is not None else "__task__",
+            )
+            for row in rows
+        ]
 
     def _file_type_label(self, task: DownloadTask) -> str:
         if task.url.startswith("magnet:"):
@@ -414,7 +517,11 @@ class TaskTableModel(QAbstractTableModel):
             self._expanded_gids.remove(task.gid)
         else:
             self._expanded_gids.add(task.gid)
-        self._rebuild_rows()
+        self._rows = self._build_rows(
+            self._tasks,
+            self._thread_rows_by_gid,
+            self._expanded_gids,
+        )
         self.endResetModel()
         return True
 

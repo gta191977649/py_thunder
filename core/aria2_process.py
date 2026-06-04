@@ -7,6 +7,7 @@ from pathlib import Path
 
 from app.config import AppConfig
 from app.paths import get_aria2_binary_path
+from app.paths import get_aria2_session_path
 
 
 class Aria2ProcessManager:
@@ -33,6 +34,8 @@ class Aria2ProcessManager:
 
         download_dir = Path(self.config.default_download_dir)
         download_dir.mkdir(parents=True, exist_ok=True)
+        session_path = get_aria2_session_path()
+        session_path.touch(exist_ok=True)
 
         command = [
             str(self.binary_path),
@@ -41,6 +44,9 @@ class Aria2ProcessManager:
             f"--rpc-listen-port={self.config.rpc_port}",
             f"--rpc-secret={self.config.rpc_secret}",
             "--continue=true",
+            f"--input-file={session_path}",
+            f"--save-session={session_path}",
+            "--save-session-interval=1",
             f"--max-concurrent-downloads={self.config.max_concurrent_downloads}",
             "--split=16",
             f"--max-connection-per-server={self.config.max_connection_per_server}",

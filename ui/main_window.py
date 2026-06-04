@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 import sys
 import threading
 from datetime import datetime
@@ -59,6 +60,7 @@ from core.formatters import (
 from core.piece_map import PieceMapSnapshot
 from core.task_model import DownloadTask, ResumeSupport, TaskStatus
 from ui.batch_task_dialog import BatchTaskDialog
+from ui.console_window import ConsoleLogHandler, ConsoleStreamProxy, ConsoleWindow
 from ui.file_menu import FileMenuCallbacks, build_file_menu
 from ui.file_menu import FileMenuActions
 from ui.floating_window import FloatingWindowPresenter
@@ -183,6 +185,7 @@ class TaskContextMenu(ThunderMenu):
 
 class MainWindow(QMainWindow):
     resume_support_resolved = pyqtSignal(str, str)
+    console_message_received = pyqtSignal(str)
 
     def __init__(
         self,
@@ -215,6 +218,11 @@ class MainWindow(QMainWindow):
         self._resume_support_pending: set[str] = set()
         self.ui_font = self._make_ui_font(int(self.theme_metric("base_font_size", 9)))
         self.notification_sound_player = NotificationSoundPlayer(self.config, self)
+        self._console_log_handler: ConsoleLogHandler | None = None
+        self._console_stdout_proxy: ConsoleStreamProxy | None = None
+        self._console_stderr_proxy: ConsoleStreamProxy | None = None
+        self._original_stdout = sys.stdout
+        self._original_stderr = sys.stderr
 
         self.setWindowTitle(self.translator.t("app.title"))
         self.setWindowIcon(QIcon(str(get_thunder5_icons_dir() / "app_icon.png")))
@@ -223,6 +231,7 @@ class MainWindow(QMainWindow):
             int(self.theme_metric("window_height", 760)),
         )
         self.setFont(self.ui_font)
+        self.console_message_received.connect(self._append_console_message)
 
         self._build_menu()
         self._build_central_ui()
@@ -244,8 +253,13 @@ class MainWindow(QMainWindow):
         )
         self._setup_tray_icon()
         self.floating_window_presenter.update_tasks(self.all_tasks)
+        self._build_console_window()
+        self._install_console_capture()
 
         self.download_manager.tasks_updated.connect(self.on_tasks_updated)
+        self.download_manager.task_runtime_snapshot_updated.connect(
+            self._on_task_runtime_snapshot_updated
+        )
         self.download_manager.task_error.connect(self.on_task_error)
         self.download_manager.aria2_unavailable.connect(self.show_aria2_warning)
         self.resume_support_resolved.connect(self._on_resume_support_resolved)
@@ -267,6 +281,61 @@ class MainWindow(QMainWindow):
 
     def theme_metric(self, key: str, fallback: int) -> int:
         return int(self.theme.get("metrics", {}).get(key, fallback))
+
+    def _build_console_window(self) -> None:
+        self.console_window = ConsoleWindow(
+            self.translator.t("console.title"),
+            self.ui_font,
+            icon=self.windowIcon(),
+            parent=self,
+        )
+        self.console_window.visibility_changed.connect(self._sync_console_window_action)
+        self.show_console_window_action.toggled.connect(self._toggle_console_window)
+
+    def _install_console_capture(self) -> None:
+        emit_message = self.console_message_received.emit
+        self._console_stdout_proxy = ConsoleStreamProxy(
+            emit_message,
+            self._original_stdout,
+            prefix="stdout",
+        )
+        self._console_stderr_proxy = ConsoleStreamProxy(
+            emit_message,
+            self._original_stderr,
+            prefix="stderr",
+        )
+        sys.stdout = self._console_stdout_proxy
+        sys.stderr = self._console_stderr_proxy
+
+        self._console_log_handler = ConsoleLogHandler(emit_message)
+        self._console_log_handler.setFormatter(
+            logging.Formatter("[%(levelname)s] %(name)s: %(message)s")
+        )
+        logging.getLogger().addHandler(self._console_log_handler)
+
+    def _uninstall_console_capture(self) -> None:
+        if sys.stdout is self._console_stdout_proxy:
+            sys.stdout = self._original_stdout
+        if sys.stderr is self._console_stderr_proxy:
+            sys.stderr = self._original_stderr
+        if self._console_log_handler is not None:
+            logging.getLogger().removeHandler(self._console_log_handler)
+            self._console_log_handler = None
+
+    def _toggle_console_window(self, visible: bool) -> None:
+        if visible:
+            self.console_window.show()
+            self.console_window.raise_()
+            self.console_window.activateWindow()
+            return
+        self.console_window.hide()
+
+    def _sync_console_window_action(self, visible: bool) -> None:
+        with QSignalBlocker(self.show_console_window_action):
+            self.show_console_window_action.setChecked(visible)
+
+    def _append_console_message(self, message: str) -> None:
+        self.console_window.append_line(message)
 
     def _build_menu(self) -> None:
         menu_bar = self.menuBar()
@@ -332,6 +401,12 @@ class MainWindow(QMainWindow):
         )
         self.show_floating_window_action.setCheckable(True)
         self.view_menu.addAction(self.show_floating_window_action)
+        self.show_console_window_action = QAction(
+            self.translator.t("menu.view.show_console_window"),
+            self,
+        )
+        self.show_console_window_action.setCheckable(True)
+        self.view_menu.addAction(self.show_console_window_action)
 
         for key in [
             "menu.settings",
@@ -730,6 +805,7 @@ class MainWindow(QMainWindow):
         self.sidebar.set_task_counts(self.all_tasks)
         self._log_status_transitions(self.all_tasks)
         self._refresh_task_view()
+        self._sync_selected_task_runtime_watch()
         self._update_global_speed_label(self.all_tasks)
         self.floating_window_presenter.update_tasks(self.all_tasks)
         self.statusBar().showMessage(
@@ -855,6 +931,8 @@ class MainWindow(QMainWindow):
             return
 
         self.floating_window_presenter.shutdown()
+        self.console_window.hide()
+        self._uninstall_console_capture()
         if self.tray_icon is not None:
             self.tray_icon.hide()
         super().closeEvent(event)
@@ -1214,13 +1292,36 @@ class MainWindow(QMainWindow):
 
     def _on_table_selection_changed(self, *_args) -> None:
         self._selected_task_gids = [task.gid for task in self._selected_tasks()]
+        self._sync_selected_task_runtime_watch()
         self._update_task_info_panel()
         self._update_action_states()
 
     def _on_runtime_tab_changed(self, _index: int) -> None:
+        self._sync_selected_task_runtime_watch()
         task = self._selected_task()
         if task:
             self._update_piece_map_for_task(task)
+
+    def _sync_selected_task_runtime_watch(self) -> None:
+        task = self._selected_task()
+        if task is None:
+            self.download_manager.watch_task_runtime(None)
+            return
+        self.download_manager.watch_task_runtime(
+            task,
+            default_slot_count=max(int(self.config.max_connection_per_server or 1), 1),
+        )
+
+    def _on_task_runtime_snapshot_updated(
+        self,
+        gid: str,
+        _snapshot,
+    ) -> None:
+        current_task = self._selected_task()
+        if current_task is None or current_task.gid != gid:
+            return
+        self._refresh_task_view()
+        self._update_runtime_views(current_task)
 
     def _toggle_task_from_table_index(self, index) -> None:
         if not index.isValid():
@@ -1278,14 +1379,14 @@ class MainWindow(QMainWindow):
         filtered_tasks = self._filtered_tasks()
         thread_rows_by_gid: dict[str, list] = {}
         for task in filtered_tasks:
-            thread_rows = self.download_manager.get_task_connection_rows(
-                task,
-                default_slot_count=max(int(self.config.max_connection_per_server or 1), 1),
-            )
+            thread_rows = self.download_manager.get_cached_task_connection_rows(task)
             if len(thread_rows) > 1:
                 thread_rows_by_gid[task.gid] = thread_rows
-        self.task_model.set_completed_view(completed_view)
-        self.task_model.set_tasks(filtered_tasks, thread_rows_by_gid)
+        self.task_model.refresh_tasks(
+            filtered_tasks,
+            thread_rows_by_gid,
+            completed_view=completed_view,
+        )
         if self._apply_completed_default_sort_on_refresh and completed_view:
             self.task_table.apply_default_sort_for_completed_view(True)
             self._apply_completed_default_sort_on_refresh = False
@@ -1750,7 +1851,9 @@ class MainWindow(QMainWindow):
     def _update_task_info_panel(self) -> None:
         task = self._selected_task()
         if not task:
-            self.task_info_label.setText(self.translator.t("info.no_task"))
+            empty_text = self.translator.t("info.no_task")
+            if self.task_info_label.text() != empty_text:
+                self.task_info_label.setText(empty_text)
             self.piece_map_widget.set_snapshot(
                 PieceMapSnapshot(
                     total_pieces=0,
@@ -1800,15 +1903,22 @@ class MainWindow(QMainWindow):
                 self.translator.t("info.task_url", url=task.url or "-"),
             ]
         )
-        self.task_info_label.setText("\n".join(lines))
-        self._update_piece_map_for_task(task)
-        thread_count, thread_lines = self.download_manager.get_thread_runtime_view(
-            task,
-            default_slot_count=max(int(self.config.max_connection_per_server or 1), 1),
-        )
-        self._ensure_runtime_thread_tabs(thread_count)
+        info_text = "\n".join(lines)
+        if self.task_info_label.text() != info_text:
+            self.task_info_label.setText(info_text)
+        self._update_runtime_views(task)
+
+    def _update_runtime_views(self, task: DownloadTask) -> None:
+        runtime_snapshot = self.download_manager.get_cached_task_runtime_snapshot(task.gid)
+        self._update_piece_map_for_task(task, runtime_snapshot=runtime_snapshot)
+        if runtime_snapshot is None:
+            self._ensure_runtime_thread_tabs(0)
+            return
+        self._ensure_runtime_thread_tabs(runtime_snapshot.thread_count)
         for index, thread_view in enumerate(self.thread_views):
-            thread_view.setPlainText(thread_lines[index])
+            line = runtime_snapshot.thread_lines[index]
+            if thread_view.toPlainText() != line:
+                thread_view.setPlainText(line)
 
     def _ensure_resume_support_probe(self, task: DownloadTask) -> None:
         if (
@@ -1888,10 +1998,29 @@ class MainWindow(QMainWindow):
 
         return ResumeSupport.UNKNOWN.value
 
-    def _update_piece_map_for_task(self, task: DownloadTask) -> None:
+    def _update_piece_map_for_task(
+        self,
+        task: DownloadTask,
+        *,
+        runtime_snapshot=None,
+    ) -> None:
         if self.runtime_tabs.currentWidget() is not self.piece_map_scroll:
             return
-        piece_snapshot = self.download_manager.get_task_piece_map_snapshot(task)
+        snapshot = runtime_snapshot or self.download_manager.get_cached_task_runtime_snapshot(
+            task.gid
+        )
+        if snapshot is None:
+            self.piece_map_widget.set_snapshot(
+                PieceMapSnapshot(
+                    total_pieces=0,
+                    display_cells=[],
+                    available=False,
+                    message="piece_map.no_data",
+                ),
+                self.translator.t("piece_map.no_data"),
+            )
+            return
+        piece_snapshot = snapshot.piece_map_snapshot
         piece_message = (
             self.translator.t(piece_snapshot.message)
             if piece_snapshot.message
@@ -1928,7 +2057,9 @@ class MainWindow(QMainWindow):
 
     def append_log(self, message: str) -> None:
         timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        self.log_view.appendPlainText(f"{timestamp}  {message}")
+        line = f"{timestamp}  {message}"
+        self.log_view.appendPlainText(line)
+        self._append_console_message(line)
 
     def _filtered_tasks(self) -> list[DownloadTask]:
         return self.download_manager.filter_tasks(self.all_tasks, self.current_filter)

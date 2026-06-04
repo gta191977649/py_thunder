@@ -79,6 +79,10 @@ def get_database_path() -> Path:
     return get_app_data_dir() / "app.db"
 
 
+def get_aria2_session_path() -> Path:
+    return get_app_data_dir() / "aria2.session"
+
+
 def get_default_download_dir() -> Path:
     download_dir = Path.home() / "Downloads"
     download_dir.mkdir(parents=True, exist_ok=True)

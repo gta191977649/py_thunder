@@ -315,7 +315,6 @@ class FloatingWindowView(QWidget):
 
     def paintEvent(self, event) -> None:
         del event
-        self._sync_window_size()
         painter = QPainter(self)
         painter.setRenderHint(QPainter.RenderHint.Antialiasing, False)
         outer_rect = QRectF(self.rect()).adjusted(0.5, 0.5, -0.5, -0.5)

@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 import math
+import threading
+from concurrent.futures import Future, ThreadPoolExecutor
+from time import monotonic
 from dataclasses import dataclass
 from pathlib import Path
 from urllib.parse import urlparse
@@ -31,10 +34,31 @@ class TaskUiOverride:
     total_length: int | None = None
 
 
+@dataclass(slots=True)
+class TaskRuntimeSnapshot:
+    connection_rows: list[TaskConnectionRow]
+    thread_count: int
+    thread_lines: list[str]
+    piece_map_snapshot: PieceMapSnapshot
+
+
+@dataclass(slots=True)
+class SyncResult:
+    tasks: list[DownloadTask]
+    connection_rows_by_gid: dict[str, list[TaskConnectionRow]]
+    watched_task_gid: str | None = None
+    watched_runtime_snapshot: TaskRuntimeSnapshot | None = None
+    task_error_message: str | None = None
+    aria2_online: bool | None = None
+    aria2_message: str = ""
+
+
 class DownloadManager(QObject):
     tasks_updated = pyqtSignal(list)
+    task_runtime_snapshot_updated = pyqtSignal(str, object)
     task_error = pyqtSignal(str)
     aria2_unavailable = pyqtSignal(str)
+    _sync_result_ready = pyqtSignal(object)
 
     def __init__(
         self,
@@ -47,17 +71,38 @@ class DownloadManager(QObject):
         self.client = client
         self.repository = repository
         self.os_service = os_service or OSIntegrationService()
+        self._sync_client = Aria2Client(
+            host=client.host,
+            port=client.port,
+            rpc_secret=client.rpc_secret,
+            timeout=client.timeout,
+        )
         self.timer = QTimer(self)
         self.timer.setInterval(refresh_interval_ms)
         self.timer.timeout.connect(self.sync_tasks)
-        self._sync_in_progress = False
+        self._sync_executor = ThreadPoolExecutor(
+            max_workers=1,
+            thread_name_prefix="pythunder-sync",
+        )
+        self._sync_future: Future | None = None
+        self._shutdown = False
+        self._state_lock = threading.RLock()
         self._aria2_online: bool | None = None
         self._last_aria2_message = ""
         self._ui_state_overrides: dict[str, TaskUiOverride] = {}
         self._suppressed_deleted_gids: set[str] = set()
         self._piece_map_parser = Aria2ControlFileParser()
         self._piece_map_cache: dict[str, tuple[tuple[str, int, int], PieceMapSnapshot]] = {}
+        self._connection_slot_count_by_gid: dict[str, int] = {}
+        self._connected_servers_by_gid: dict[str, tuple[float, list[dict]]] = {}
+        self._connected_peers_by_gid: dict[str, tuple[float, list[dict]]] = {}
+        self._cached_connection_rows_by_gid: dict[str, list[TaskConnectionRow]] = {}
+        self._runtime_snapshot_by_gid: dict[str, TaskRuntimeSnapshot] = {}
+        self._watched_task_gid: str | None = None
+        self._watched_task_default_slot_count = 16
+        self._watched_task_max_display_cells = 8192
         self.task_list_exchange = TaskListExchangeService()
+        self._sync_result_ready.connect(self._apply_sync_result)
 
     def start(self) -> None:
         if not self.timer.isActive():
@@ -66,6 +111,8 @@ class DownloadManager(QObject):
 
     def stop(self) -> None:
         self.timer.stop()
+        self._shutdown = True
+        self._sync_executor.shutdown(wait=False, cancel_futures=True)
 
     def add_http_task(self, url: str, download_dir: str):
         return self.add_uri_task(url, download_dir)
@@ -174,6 +221,11 @@ class DownloadManager(QObject):
         try:
             self.client.remove(gid)
             self._ui_state_overrides.pop(gid, None)
+            self._connection_slot_count_by_gid.pop(gid, None)
+            self._connected_servers_by_gid.pop(gid, None)
+            self._connected_peers_by_gid.pop(gid, None)
+            self._cached_connection_rows_by_gid.pop(gid, None)
+            self._runtime_snapshot_by_gid.pop(gid, None)
             self.repository.mark_removed(gid)
             self._set_aria2_state(True)
             self.sync_tasks()
@@ -217,58 +269,248 @@ class DownloadManager(QObject):
             QTimer.singleShot(200, self.sync_tasks)
 
     def sync_tasks(self) -> None:
-        if self._sync_in_progress:
+        if self._shutdown:
             return
+        with self._state_lock:
+            if self._sync_future is not None and not self._sync_future.done():
+                return
+            self._sync_future = self._sync_executor.submit(self._sync_tasks_worker)
 
-        self._sync_in_progress = True
+    def _sync_tasks_worker(self) -> None:
         try:
-            repository_tasks = {task.gid: task for task in self.repository.list_all()}
-            live_tasks = {}
-            seen_rpc_gids: set[str] = set()
-            rpc_task_sets = [
-                self.client.tell_active() or [],
-                self.client.tell_waiting() or [],
-                self.client.tell_stopped() or [],
-            ]
-
-            for rpc_tasks in rpc_task_sets:
-                for task_data in rpc_tasks:
-                    gid = task_data.get("gid", "")
-                    if gid:
-                        seen_rpc_gids.add(gid)
-                    if gid in self._suppressed_deleted_gids:
-                        self._purge_download_result(gid)
-                        continue
-                    reported_status = task_data.get("status", TaskStatus.UNKNOWN.value)
-                    existing_task = repository_tasks.get(gid)
-                    if existing_task and existing_task.status_enum == TaskStatus.REMOVED:
-                        live_tasks[existing_task.gid] = existing_task
-                        continue
-                    task = aria2_dict_to_download_task(task_data)
-                    if existing_task and existing_task.resume_support:
-                        task.resume_support = existing_task.resume_support
-                    self._merge_task_timing(existing_task, task)
-                    self._apply_ui_override(task, reported_status=reported_status)
-                    self.repository.upsert_from_download_task(task)
-                    live_tasks[task.gid] = task
-
-            for task in repository_tasks.values():
-                self._apply_ui_override(task)
-            repository_tasks.update(live_tasks)
-            for task in repository_tasks.values():
-                self._apply_ui_override(task)
-
-            self._suppressed_deleted_gids.intersection_update(seen_rpc_gids)
-            self._set_aria2_state(True)
-            self.tasks_updated.emit(self.sort_tasks(repository_tasks.values()))
+            result = self._build_sync_result()
         except Aria2RPCError as exc:
-            self._update_aria2_state_from_error(exc)
-            self._emit_persisted_tasks()
+            result = SyncResult(
+                tasks=self.sort_tasks(self.repository.list_all()),
+                connection_rows_by_gid={},
+                aria2_online=False if isinstance(exc, Aria2ConnectionError) else None,
+                aria2_message=str(exc) if isinstance(exc, Aria2ConnectionError) else "",
+            )
         except Exception as exc:  # pragma: no cover - defensive UI safety
-            self.task_error.emit(f"Unexpected sync error: {exc}")
-            self._emit_persisted_tasks()
-        finally:
-            self._sync_in_progress = False
+            result = SyncResult(
+                tasks=self.sort_tasks(self.repository.list_all()),
+                connection_rows_by_gid={},
+                task_error_message=f"Unexpected sync error: {exc}",
+            )
+        self._sync_result_ready.emit(result)
+
+    def _build_sync_result(self) -> SyncResult:
+        repository_tasks = {task.gid: task for task in self.repository.list_all()}
+        live_tasks: dict[str, DownloadTask] = {}
+        seen_rpc_gids: set[str] = set()
+        rpc_task_sets = [
+            self._sync_client.tell_active() or [],
+            self._sync_client.tell_waiting() or [],
+            self._sync_client.tell_stopped() or [],
+        ]
+
+        with self._state_lock:
+            suppressed_deleted_gids = set(self._suppressed_deleted_gids)
+
+        for rpc_tasks in rpc_task_sets:
+            for task_data in rpc_tasks:
+                gid = task_data.get("gid", "")
+                if gid:
+                    seen_rpc_gids.add(gid)
+                if gid in suppressed_deleted_gids:
+                    self._purge_download_result(gid, client=self._sync_client)
+                    continue
+                existing_task = repository_tasks.get(gid)
+                if existing_task and existing_task.status_enum == TaskStatus.REMOVED:
+                    live_tasks[existing_task.gid] = existing_task
+                    continue
+                task = aria2_dict_to_download_task(task_data)
+                if existing_task and existing_task.resume_support:
+                    task.resume_support = existing_task.resume_support
+                self._merge_task_timing(existing_task, task)
+                self.repository.upsert_from_download_task(task)
+                live_tasks[task.gid] = task
+
+        repository_tasks.update(live_tasks)
+        self._normalize_detached_tasks(repository_tasks, seen_rpc_gids)
+        tasks = self.sort_tasks(repository_tasks.values())
+        connection_rows_by_gid = self._build_connection_rows_snapshot(tasks)
+        watched_task_gid, runtime_snapshot = self._build_watched_runtime_snapshot(tasks)
+        return SyncResult(
+            tasks=tasks,
+            connection_rows_by_gid=connection_rows_by_gid,
+            watched_task_gid=watched_task_gid,
+            watched_runtime_snapshot=runtime_snapshot,
+            aria2_online=True,
+        )
+
+    def _normalize_detached_tasks(
+        self,
+        repository_tasks: dict[str, DownloadTask],
+        seen_rpc_gids: set[str],
+    ) -> None:
+        for gid, task in list(repository_tasks.items()):
+            if gid in seen_rpc_gids:
+                continue
+            if task.status_enum in {
+                TaskStatus.COMPLETE,
+                TaskStatus.ERROR,
+                TaskStatus.FAILED,
+                TaskStatus.REMOVED,
+            }:
+                continue
+            if task.status_enum == TaskStatus.ACTIVE:
+                self._finalize_active_elapsed(task)
+            task.status = TaskStatus.PAUSED.value
+            task.download_speed = 0
+            task.updated_at = utc_now_iso()
+            task.active_started_at = None
+            self.repository.upsert_from_download_task(task)
+            repository_tasks[gid] = task
+
+    def _build_connection_rows_snapshot(
+        self,
+        tasks: list[DownloadTask],
+    ) -> dict[str, list[TaskConnectionRow]]:
+        connection_rows_by_gid: dict[str, list[TaskConnectionRow]] = {}
+        for task in tasks:
+            if task.status_enum != TaskStatus.ACTIVE:
+                continue
+            rows = self.get_task_connection_rows(
+                task,
+                client=self._sync_client,
+            )
+            if rows:
+                connection_rows_by_gid[task.gid] = rows
+        return connection_rows_by_gid
+
+    def _build_watched_runtime_snapshot(
+        self,
+        tasks: list[DownloadTask],
+    ) -> tuple[str | None, TaskRuntimeSnapshot | None]:
+        with self._state_lock:
+            watched_task_gid = self._watched_task_gid
+            default_slot_count = self._watched_task_default_slot_count
+            max_display_cells = self._watched_task_max_display_cells
+
+        if not watched_task_gid:
+            return None, None
+
+        watched_task = next((task for task in tasks if task.gid == watched_task_gid), None)
+        if watched_task is None:
+            return watched_task_gid, None
+
+        connection_rows = self.get_task_connection_rows(
+            watched_task,
+            default_slot_count=default_slot_count,
+            client=self._sync_client,
+        )
+        thread_count, thread_lines = self.get_thread_runtime_view(
+            watched_task,
+            default_slot_count=default_slot_count,
+            client=self._sync_client,
+        )
+        piece_map_snapshot = self.get_task_piece_map_snapshot(
+            watched_task,
+            max_display_cells=max_display_cells,
+            client=self._sync_client,
+        )
+        return watched_task_gid, TaskRuntimeSnapshot(
+            connection_rows=connection_rows,
+            thread_count=thread_count,
+            thread_lines=thread_lines,
+            piece_map_snapshot=piece_map_snapshot,
+        )
+
+    def _apply_sync_result(self, result: SyncResult) -> None:
+        with self._state_lock:
+            self._cached_connection_rows_by_gid = {
+                gid: list(rows) for gid, rows in result.connection_rows_by_gid.items()
+            }
+            active_gids = {task.gid for task in result.tasks if task.status_enum == TaskStatus.ACTIVE}
+            stale_runtime_gids = [
+                gid for gid in self._runtime_snapshot_by_gid if gid not in active_gids and gid != result.watched_task_gid
+            ]
+            for gid in stale_runtime_gids:
+                self._runtime_snapshot_by_gid.pop(gid, None)
+            if result.watched_task_gid:
+                if result.watched_runtime_snapshot is None:
+                    self._runtime_snapshot_by_gid.pop(result.watched_task_gid, None)
+                else:
+                    self._runtime_snapshot_by_gid[result.watched_task_gid] = result.watched_runtime_snapshot
+            self._suppressed_deleted_gids.intersection_update({task.gid for task in result.tasks})
+
+        if result.aria2_online is not None:
+            self._set_aria2_state(result.aria2_online, result.aria2_message)
+        if result.task_error_message:
+            self.task_error.emit(result.task_error_message)
+
+        tasks = [self._clone_task(task) for task in result.tasks]
+        for task in tasks:
+            self._apply_ui_override(task)
+
+        self.tasks_updated.emit(tasks)
+        if result.watched_task_gid and result.watched_runtime_snapshot is not None:
+            self.task_runtime_snapshot_updated.emit(
+                result.watched_task_gid,
+                result.watched_runtime_snapshot,
+            )
+
+    def watch_task_runtime(
+        self,
+        task: DownloadTask | None,
+        *,
+        default_slot_count: int = 16,
+        max_display_cells: int = 8192,
+    ) -> None:
+        with self._state_lock:
+            next_gid = task.gid if task is not None else None
+            next_slot_count = max(int(default_slot_count or 1), 1)
+            next_display_cells = max(int(max_display_cells or 1), 1)
+            changed = (
+                self._watched_task_gid != next_gid
+                or self._watched_task_default_slot_count != next_slot_count
+                or self._watched_task_max_display_cells != next_display_cells
+            )
+            self._watched_task_gid = task.gid if task is not None else None
+            self._watched_task_default_slot_count = next_slot_count
+            self._watched_task_max_display_cells = next_display_cells
+        if task is None:
+            return
+        if changed:
+            self.sync_tasks()
+
+    def get_cached_task_connection_rows(self, task: DownloadTask) -> list[TaskConnectionRow]:
+        with self._state_lock:
+            rows = self._cached_connection_rows_by_gid.get(task.gid) or []
+            return list(rows)
+
+    def get_cached_task_runtime_snapshot(self, gid: str) -> TaskRuntimeSnapshot | None:
+        with self._state_lock:
+            snapshot = self._runtime_snapshot_by_gid.get(gid)
+            if snapshot is None:
+                return None
+            return TaskRuntimeSnapshot(
+                connection_rows=list(snapshot.connection_rows),
+                thread_count=int(snapshot.thread_count),
+                thread_lines=list(snapshot.thread_lines),
+                piece_map_snapshot=snapshot.piece_map_snapshot,
+            )
+
+    @staticmethod
+    def _clone_task(task: DownloadTask) -> DownloadTask:
+        return DownloadTask(
+            gid=task.gid,
+            name=task.name,
+            url=task.url,
+            save_path=task.save_path,
+            status=task.status,
+            total_length=int(task.total_length or 0),
+            completed_length=int(task.completed_length or 0),
+            download_speed=int(task.download_speed or 0),
+            created_at=task.created_at,
+            updated_at=task.updated_at,
+            completed_at=task.completed_at,
+            error_message=task.error_message,
+            resume_support=task.resume_support,
+            elapsed_seconds=int(task.elapsed_seconds or 0),
+            active_started_at=task.active_started_at,
+        )
 
     def _run_task_action(self, action_name: str, gid: str, action) -> None:
         try:
@@ -324,15 +566,24 @@ class DownloadManager(QObject):
         for task in actionable_tasks:
             try:
                 if task.status_enum in {TaskStatus.ERROR, TaskStatus.FAILED}:
-                    new_gid = self.redownload_task(task)
+                    new_gid = self._restore_incomplete_task(task)
                     if new_gid:
                         any_success = True
                 elif task.status_enum == TaskStatus.REMOVED:
                     self._restore_removed_task(task)
                     any_success = True
                 else:
-                    self.client.unpause(task.gid)
-                    self._optimistically_update_task(task.gid, "resume")
+                    try:
+                        self.client.unpause(task.gid)
+                        self._optimistically_update_task(task.gid, "resume")
+                    except Aria2RPCError as exc:
+                        if not self._is_missing_aria2_task_error(exc):
+                            raise
+                        new_gid = self._restore_incomplete_task(task)
+                        if new_gid:
+                            any_success = True
+                            self._set_aria2_state(True)
+                            continue
                     any_success = True
                 self._set_aria2_state(True)
             except Aria2RPCError as exc:
@@ -354,45 +605,9 @@ class DownloadManager(QObject):
             self.repository.upsert_from_download_task(task)
             return
 
-        if not task.url:
+        restored_gid = self._restore_incomplete_task(task)
+        if restored_gid is None:
             raise ValueError("No task URL is available for restore.")
-
-        target_dir = Path(task.save_path).expanduser() if task.save_path else Path(".")
-        target_dir.mkdir(parents=True, exist_ok=True)
-        options, output_name = self._build_unique_uri_options(
-            task.url,
-            target_dir,
-            preferred_name=task.name,
-            exclude_gid=task.gid,
-        )
-        new_gid = self.client.add_uri([task.url], options or None)
-
-        self._ui_state_overrides.pop(task.gid, None)
-        try:
-            self.client.remove(task.gid)
-        except Aria2RPCError:
-            pass
-        self.repository.delete_by_gid(task.gid)
-
-        try:
-            restored_task = aria2_dict_to_download_task(self.client.tell_status(new_gid))
-        except Aria2RPCError:
-            restored_task = DownloadTask(
-                gid=new_gid,
-                name=output_name or task.name,
-                url=task.url,
-                save_path=str(target_dir),
-                status=TaskStatus.WAITING.value,
-                total_length=task.total_length,
-                completed_length=task.completed_length,
-                created_at=utc_now_iso(),
-                updated_at=utc_now_iso(),
-                resume_support=task.resume_support,
-                elapsed_seconds=0,
-                active_started_at=None,
-            )
-
-        self.repository.upsert_from_download_task(restored_task)
 
     def _optimistically_update_task(self, gid: str, action_name: str) -> None:
         task = self.repository.get_by_gid(gid)
@@ -419,6 +634,51 @@ class DownloadManager(QObject):
 
         task.updated_at = utc_now_iso()
         self.repository.upsert_from_download_task(task)
+
+    def _restore_incomplete_task(self, task: DownloadTask) -> str | None:
+        if not task.url:
+            raise ValueError("No task URL is available for restore.")
+
+        target_dir = Path(task.save_path).expanduser() if task.save_path else Path(".")
+        target_dir.mkdir(parents=True, exist_ok=True)
+        options, output_name = self._build_resume_uri_options(task, target_dir)
+        new_gid = self.client.add_uri([task.url], options or None)
+
+        self._ui_state_overrides.pop(task.gid, None)
+        self._connection_slot_count_by_gid.pop(task.gid, None)
+        self._connected_servers_by_gid.pop(task.gid, None)
+        self._connected_peers_by_gid.pop(task.gid, None)
+        self._cached_connection_rows_by_gid.pop(task.gid, None)
+        self._runtime_snapshot_by_gid.pop(task.gid, None)
+        self._piece_map_cache.pop(task.gid, None)
+        try:
+            self.client.remove(task.gid)
+        except Aria2RPCError:
+            pass
+        self.repository.delete_by_gid(task.gid)
+
+        try:
+            restored_task = aria2_dict_to_download_task(self.client.tell_status(new_gid))
+        except Aria2RPCError:
+            restored_task = DownloadTask(
+                gid=new_gid,
+                name=output_name or task.name,
+                url=task.url,
+                save_path=str(target_dir),
+                status=TaskStatus.WAITING.value,
+                total_length=task.total_length,
+                completed_length=task.completed_length,
+                created_at=utc_now_iso(),
+                updated_at=utc_now_iso(),
+                resume_support=task.resume_support,
+                elapsed_seconds=max(int(task.elapsed_seconds or 0), 0),
+                active_started_at=None,
+            )
+
+        if not restored_task.resume_support:
+            restored_task.resume_support = task.resume_support
+        self.repository.upsert_from_download_task(restored_task)
+        return new_gid
 
     def _apply_ui_override(
         self,
@@ -462,6 +722,8 @@ class DownloadManager(QObject):
             self._suppressed_deleted_gids.add(task.gid)
             self._ui_state_overrides.pop(task.gid, None)
             self._piece_map_cache.pop(task.gid, None)
+            self._cached_connection_rows_by_gid.pop(task.gid, None)
+            self._runtime_snapshot_by_gid.pop(task.gid, None)
             if task.status_enum in {
                 TaskStatus.ACTIVE,
                 TaskStatus.WAITING,
@@ -511,14 +773,23 @@ class DownloadManager(QObject):
         if isinstance(exc, Aria2ConnectionError):
             self._set_aria2_state(False, str(exc))
 
-    def _purge_download_result(self, gid: str) -> None:
+    def _purge_download_result(
+        self,
+        gid: str,
+        *,
+        client: Aria2Client | None = None,
+    ) -> None:
+        rpc_client = client or self.client
         try:
-            self.client.remove_download_result(gid)
+            rpc_client.remove_download_result(gid)
         except Aria2RPCError:
             pass
 
     def _emit_persisted_tasks(self) -> None:
-        self.tasks_updated.emit(self.sort_tasks(self.repository.list_all()))
+        tasks = [self._clone_task(task) for task in self.sort_tasks(self.repository.list_all())]
+        for task in tasks:
+            self._apply_ui_override(task)
+        self.tasks_updated.emit(tasks)
 
     def _set_aria2_state(self, online: bool, message: str = "") -> None:
         previous_state = self._aria2_online
@@ -678,10 +949,12 @@ class DownloadManager(QObject):
         task: DownloadTask,
         *,
         max_display_cells: int = 8192,
+        client: Aria2Client | None = None,
     ) -> PieceMapSnapshot:
         rpc_snapshot = self._get_task_piece_map_snapshot_from_rpc(
             task,
             max_display_cells=max_display_cells,
+            client=client,
         )
         if rpc_snapshot is not None:
             return rpc_snapshot
@@ -711,7 +984,10 @@ class DownloadManager(QObject):
             return self._apply_piece_map_progress_fallback(
                 task,
                 cached_entry[1],
-                active_connection_count=self._get_active_connection_count(task),
+                active_connection_count=self._get_active_connection_count(
+                    task,
+                    client=client,
+                ),
             )
 
         snapshot = self._piece_map_parser.parse(
@@ -722,17 +998,22 @@ class DownloadManager(QObject):
         return self._apply_piece_map_progress_fallback(
             task,
             snapshot,
-                active_connection_count=self._get_active_connection_count(task),
-            )
+            active_connection_count=self._get_active_connection_count(
+                task,
+                client=client,
+            ),
+        )
 
     def _get_task_piece_map_snapshot_from_rpc(
         self,
         task: DownloadTask,
         *,
         max_display_cells: int,
+        client: Aria2Client | None = None,
     ) -> PieceMapSnapshot | None:
+        rpc_client = client or self.client
         try:
-            status_data = self.client.tell_status(
+            status_data = rpc_client.tell_status(
                 task.gid,
                 [
                     "gid",
@@ -771,11 +1052,16 @@ class DownloadManager(QObject):
         )
         return snapshot
 
-    def _get_active_connection_count(self, task: DownloadTask) -> int:
+    def _get_active_connection_count(
+        self,
+        task: DownloadTask,
+        *,
+        client: Aria2Client | None = None,
+    ) -> int:
         try:
             if self._is_bt_task(task):
-                return len(self._fetch_connected_peers(task))
-            return len(self._fetch_connected_servers(task))
+                return len(self._fetch_connected_peers(task, client=client))
+            return len(self._fetch_connected_servers(task, client=client))
         except Exception:
             return 0
 
@@ -990,6 +1276,22 @@ class DownloadManager(QObject):
         options["out"] = output_name
         return options, output_name
 
+    def _build_resume_uri_options(
+        self,
+        task: DownloadTask,
+        target_dir: Path,
+    ) -> tuple[dict[str, str], str | None]:
+        options = {"dir": str(target_dir)}
+        candidate_name = (
+            (task.name or "").strip()
+            or self._infer_output_name_from_url(task.url)
+            or ""
+        ).strip()
+        if candidate_name:
+            options["out"] = candidate_name
+            return options, candidate_name
+        return options, None
+
     def _make_unique_output_name(
         self,
         target_dir: Path,
@@ -1070,21 +1372,18 @@ class DownloadManager(QObject):
         task: DownloadTask,
         *,
         default_slot_count: int = 16,
+        client: Aria2Client | None = None,
     ) -> tuple[int, list[str]]:
-        slot_count = max(int(default_slot_count or 1), 1)
-        try:
-            options = self.client.get_option(task.gid) or {}
-            slot_count = max(
-                int(options.get("max-connection-per-server", slot_count) or slot_count),
-                1,
-            )
-        except (Aria2RPCError, ValueError, TypeError):
-            pass
+        slot_count = self._get_connection_slot_count(
+            task.gid,
+            default_slot_count=default_slot_count,
+            client=client,
+        )
 
         if self._is_bt_task(task):
-            lines = self._build_peer_runtime_lines(task, slot_count)
+            lines = self._build_peer_runtime_lines(task, slot_count, client=client)
             return len(lines), lines
-        lines = self._build_server_runtime_lines(task, slot_count)
+        lines = self._build_server_runtime_lines(task, slot_count, client=client)
         return len(lines), lines
 
     def get_task_connection_rows(
@@ -1092,20 +1391,43 @@ class DownloadManager(QObject):
         task: DownloadTask,
         *,
         default_slot_count: int = 16,
+        client: Aria2Client | None = None,
     ) -> list[TaskConnectionRow]:
-        slot_count = max(int(default_slot_count or 1), 1)
+        slot_count = self._get_connection_slot_count(
+            task.gid,
+            default_slot_count=default_slot_count,
+            client=client,
+        )
+
+        if self._is_bt_task(task):
+            return self._build_peer_connection_rows(task, slot_count, client=client)
+        return self._build_server_connection_rows(task, slot_count, client=client)
+
+    def _get_connection_slot_count(
+        self,
+        gid: str,
+        *,
+        default_slot_count: int = 16,
+        client: Aria2Client | None = None,
+    ) -> int:
+        fallback = max(int(default_slot_count or 1), 1)
+        cached = self._connection_slot_count_by_gid.get(gid)
+        if cached is not None:
+            return cached
+
+        slot_count = fallback
+        rpc_client = client or self.client
         try:
-            options = self.client.get_option(task.gid) or {}
+            options = rpc_client.get_option(gid) or {}
             slot_count = max(
                 int(options.get("max-connection-per-server", slot_count) or slot_count),
                 1,
             )
         except (Aria2RPCError, ValueError, TypeError):
-            pass
+            slot_count = fallback
 
-        if self._is_bt_task(task):
-            return self._build_peer_connection_rows(task, slot_count)
-        return self._build_server_connection_rows(task, slot_count)
+        self._connection_slot_count_by_gid[gid] = slot_count
+        return slot_count
 
     def open_task_url(self, task: DownloadTask) -> None:
         self.os_service.open_url(task.url)
@@ -1153,8 +1475,10 @@ class DownloadManager(QObject):
         self,
         task: DownloadTask,
         slot_count: int,
+        *,
+        client: Aria2Client | None = None,
     ) -> list[str]:
-        connected_servers = self._fetch_connected_servers(task)
+        connected_servers = self._fetch_connected_servers(task, client=client)
         lines: list[str] = []
         for server in connected_servers[:slot_count]:
             lines.append(
@@ -1173,9 +1497,14 @@ class DownloadManager(QObject):
         self,
         task: DownloadTask,
         slot_count: int,
+        *,
+        client: Aria2Client | None = None,
     ) -> list[TaskConnectionRow]:
         rows: list[TaskConnectionRow] = []
-        for index, server in enumerate(self._fetch_connected_servers(task)[:slot_count], start=1):
+        for index, server in enumerate(
+            self._fetch_connected_servers(task, client=client)[:slot_count],
+            start=1,
+        ):
             rows.append(
                 TaskConnectionRow(
                     label=f"连接{index}",
@@ -1184,23 +1513,41 @@ class DownloadManager(QObject):
             )
         return rows
 
-    def _fetch_connected_servers(self, task: DownloadTask) -> list[dict]:
+    def _fetch_connected_servers(
+        self,
+        task: DownloadTask,
+        *,
+        client: Aria2Client | None = None,
+    ) -> list[dict]:
+        if task.status_enum != TaskStatus.ACTIVE:
+            self._connected_servers_by_gid.pop(task.gid, None)
+            return []
+
+        cached = self._connected_servers_by_gid.get(task.gid)
+        now = monotonic()
+        if cached is not None and now - cached[0] < 2.0:
+            return cached[1]
+
         connected_servers: list[dict] = []
+        rpc_client = client or self.client
         try:
-            server_groups = self.client.get_servers(task.gid) or []
+            server_groups = rpc_client.get_servers(task.gid) or []
             for group in server_groups:
                 connected_servers.extend(group.get("servers") or [])
         except Aria2RPCError:
             connected_servers = []
+        self._connected_servers_by_gid[task.gid] = (now, connected_servers)
         return connected_servers
 
     def _build_peer_runtime_lines(
         self,
         task: DownloadTask,
         slot_count: int,
+        *,
+        client: Aria2Client | None = None,
     ) -> list[str]:
         lines: list[str] = []
-        for peer in self._fetch_connected_peers(task)[:slot_count]:
+        for peer in self._fetch_connected_peers(task, client=client)[:slot_count]:
             lines.append(
                 "\n".join(
                     [
@@ -1220,9 +1567,14 @@ class DownloadManager(QObject):
         self,
         task: DownloadTask,
         slot_count: int,
+        *,
+        client: Aria2Client | None = None,
     ) -> list[TaskConnectionRow]:
         rows: list[TaskConnectionRow] = []
-        for index, peer in enumerate(self._fetch_connected_peers(task)[:slot_count], start=1):
+        for index, peer in enumerate(
+            self._fetch_connected_peers(task, client=client)[:slot_count],
+            start=1,
+        ):
             rows.append(
                 TaskConnectionRow(
                     label=f"连接{index}",
@@ -1231,10 +1583,26 @@ class DownloadManager(QObject):
             )
         return rows
 
-    def _fetch_connected_peers(self, task: DownloadTask) -> list[dict]:
+    def _fetch_connected_peers(
+        self,
+        task: DownloadTask,
+        *,
+        client: Aria2Client | None = None,
+    ) -> list[dict]:
+        if task.status_enum != TaskStatus.ACTIVE:
+            self._connected_peers_by_gid.pop(task.gid, None)
+            return []
+
+        cached = self._connected_peers_by_gid.get(task.gid)
+        now = monotonic()
+        if cached is not None and now - cached[0] < 2.0:
+            return cached[1]
+
         peers: list[dict] = []
+        rpc_client = client or self.client
         try:
-            peers = self.client.get_peers(task.gid) or []
+            peers = rpc_client.get_peers(task.gid) or []
         except Aria2RPCError:
             peers = []
+        self._connected_peers_by_gid[task.gid] = (now, peers)
         return peers
