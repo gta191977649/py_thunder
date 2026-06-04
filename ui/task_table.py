@@ -534,6 +534,9 @@ class TaskTableModel(QAbstractTableModel):
     def visible_parent_tasks(self) -> list[DownloadTask]:
         return [row_entry.task for row_entry in self._rows if not row_entry.is_child]
 
+    def expanded_gids(self) -> set[str]:
+        return set(self._expanded_gids)
+
 
 class ProgressBarDelegate(QStyledItemDelegate):
     def __init__(self, theme: dict, parent=None) -> None:
@@ -795,6 +798,7 @@ class TaskHeaderView(QHeaderView):
 
 
 class TaskTableView(QTableView):
+    expansion_changed = pyqtSignal()
     remove_requested = pyqtSignal()
     permanent_delete_requested = pyqtSignal()
 
@@ -980,6 +984,7 @@ class TaskTableView(QTableView):
                     )
                     if box_rect.contains(event.position().toPoint()):
                         if model.toggle_expanded_at_row(index.row()):
+                            self.expansion_changed.emit()
                             event.accept()
                             return
         super().mousePressEvent(event)

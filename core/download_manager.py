@@ -45,20 +45,27 @@ class TaskRuntimeSnapshot:
 @dataclass(slots=True)
 class SyncResult:
     tasks: list[DownloadTask]
-    connection_rows_by_gid: dict[str, list[TaskConnectionRow]]
-    watched_task_gid: str | None = None
-    watched_runtime_snapshot: TaskRuntimeSnapshot | None = None
     task_error_message: str | None = None
     aria2_online: bool | None = None
     aria2_message: str = ""
 
 
+@dataclass(slots=True)
+class RuntimeDetailResult:
+    connection_rows_by_gid: dict[str, list[TaskConnectionRow]]
+    watched_task_gid: str | None = None
+    watched_runtime_snapshot: TaskRuntimeSnapshot | None = None
+    task_error_message: str | None = None
+
+
 class DownloadManager(QObject):
     tasks_updated = pyqtSignal(list)
+    runtime_details_updated = pyqtSignal()
     task_runtime_snapshot_updated = pyqtSignal(str, object)
     task_error = pyqtSignal(str)
     aria2_unavailable = pyqtSignal(str)
     _sync_result_ready = pyqtSignal(object)
+    _runtime_detail_result_ready = pyqtSignal(object)
 
     def __init__(
         self,
@@ -77,6 +84,12 @@ class DownloadManager(QObject):
             rpc_secret=client.rpc_secret,
             timeout=client.timeout,
         )
+        self._detail_client = Aria2Client(
+            host=client.host,
+            port=client.port,
+            rpc_secret=client.rpc_secret,
+            timeout=client.timeout,
+        )
         self.timer = QTimer(self)
         self.timer.setInterval(refresh_interval_ms)
         self.timer.timeout.connect(self.sync_tasks)
@@ -84,11 +97,17 @@ class DownloadManager(QObject):
             max_workers=1,
             thread_name_prefix="pythunder-sync",
         )
+        self._detail_executor = ThreadPoolExecutor(
+            max_workers=1,
+            thread_name_prefix="pythunder-runtime",
+        )
         self._sync_future: Future | None = None
+        self._detail_future: Future | None = None
         self._shutdown = False
         self._state_lock = threading.RLock()
         self._aria2_online: bool | None = None
         self._last_aria2_message = ""
+        self._last_runtime_detail_sync_started = 0.0
         self._ui_state_overrides: dict[str, TaskUiOverride] = {}
         self._suppressed_deleted_gids: set[str] = set()
         self._piece_map_parser = Aria2ControlFileParser()
@@ -98,11 +117,13 @@ class DownloadManager(QObject):
         self._connected_peers_by_gid: dict[str, tuple[float, list[dict]]] = {}
         self._cached_connection_rows_by_gid: dict[str, list[TaskConnectionRow]] = {}
         self._runtime_snapshot_by_gid: dict[str, TaskRuntimeSnapshot] = {}
+        self._observed_connection_row_gids: set[str] = set()
         self._watched_task_gid: str | None = None
         self._watched_task_default_slot_count = 16
         self._watched_task_max_display_cells = 8192
         self.task_list_exchange = TaskListExchangeService()
         self._sync_result_ready.connect(self._apply_sync_result)
+        self._runtime_detail_result_ready.connect(self._apply_runtime_detail_result)
 
     def start(self) -> None:
         if not self.timer.isActive():
@@ -113,6 +134,7 @@ class DownloadManager(QObject):
         self.timer.stop()
         self._shutdown = True
         self._sync_executor.shutdown(wait=False, cancel_futures=True)
+        self._detail_executor.shutdown(wait=False, cancel_futures=True)
 
     def add_http_task(self, url: str, download_dir: str):
         return self.add_uri_task(url, download_dir)
@@ -282,14 +304,12 @@ class DownloadManager(QObject):
         except Aria2RPCError as exc:
             result = SyncResult(
                 tasks=self.sort_tasks(self.repository.list_all()),
-                connection_rows_by_gid={},
                 aria2_online=False if isinstance(exc, Aria2ConnectionError) else None,
                 aria2_message=str(exc) if isinstance(exc, Aria2ConnectionError) else "",
             )
         except Exception as exc:  # pragma: no cover - defensive UI safety
             result = SyncResult(
                 tasks=self.sort_tasks(self.repository.list_all()),
-                connection_rows_by_gid={},
                 task_error_message=f"Unexpected sync error: {exc}",
             )
         self._sync_result_ready.emit(result)
@@ -329,14 +349,100 @@ class DownloadManager(QObject):
         repository_tasks.update(live_tasks)
         self._normalize_detached_tasks(repository_tasks, seen_rpc_gids)
         tasks = self.sort_tasks(repository_tasks.values())
-        connection_rows_by_gid = self._build_connection_rows_snapshot(tasks)
-        watched_task_gid, runtime_snapshot = self._build_watched_runtime_snapshot(tasks)
         return SyncResult(
             tasks=tasks,
+            aria2_online=True,
+        )
+
+    def sync_runtime_details(self, *, force: bool = False) -> None:
+        if self._shutdown:
+            return
+
+        with self._state_lock:
+            should_sync = bool(
+                self._watched_task_gid or self._observed_connection_row_gids
+            )
+            if not should_sync:
+                return
+            if self._detail_future is not None and not self._detail_future.done():
+                return
+            now = monotonic()
+            if not force and now - self._last_runtime_detail_sync_started < 0.4:
+                return
+            self._last_runtime_detail_sync_started = now
+            self._detail_future = self._detail_executor.submit(
+                self._runtime_detail_worker
+            )
+
+    def _runtime_detail_worker(self) -> None:
+        try:
+            result = self._build_runtime_detail_result()
+        except Exception as exc:  # pragma: no cover - defensive UI safety
+            result = RuntimeDetailResult(
+                connection_rows_by_gid={},
+                task_error_message=f"Unexpected runtime sync error: {exc}",
+            )
+        self._runtime_detail_result_ready.emit(result)
+
+    def _build_runtime_detail_result(self) -> RuntimeDetailResult:
+        repository_tasks = {
+            task.gid: task for task in self.sort_tasks(self.repository.list_all())
+        }
+        with self._state_lock:
+            observed_gids = set(self._observed_connection_row_gids)
+            watched_task_gid = self._watched_task_gid
+            default_slot_count = self._watched_task_default_slot_count
+            max_display_cells = self._watched_task_max_display_cells
+
+        connection_rows_by_gid: dict[str, list[TaskConnectionRow]] = {}
+        for gid in observed_gids:
+            task = repository_tasks.get(gid)
+            if task is None or task.status_enum != TaskStatus.ACTIVE:
+                continue
+            rows = self.get_task_connection_rows(
+                task,
+                default_slot_count=default_slot_count,
+                client=self._detail_client,
+            )
+            if rows:
+                connection_rows_by_gid[gid] = rows
+
+        if not watched_task_gid:
+            return RuntimeDetailResult(connection_rows_by_gid=connection_rows_by_gid)
+
+        watched_task = repository_tasks.get(watched_task_gid)
+        if watched_task is None:
+            return RuntimeDetailResult(
+                connection_rows_by_gid=connection_rows_by_gid,
+                watched_task_gid=watched_task_gid,
+            )
+
+        connection_rows = self.get_task_connection_rows(
+            watched_task,
+            default_slot_count=default_slot_count,
+            client=self._detail_client,
+        )
+        if connection_rows:
+            connection_rows_by_gid[watched_task_gid] = connection_rows
+        thread_count, thread_lines = self.get_thread_runtime_view(
+            watched_task,
+            default_slot_count=default_slot_count,
+            client=self._detail_client,
+        )
+        piece_map_snapshot = self.get_task_piece_map_snapshot(
+            watched_task,
+            max_display_cells=max_display_cells,
+            client=self._detail_client,
+        )
+        return RuntimeDetailResult(
             connection_rows_by_gid=connection_rows_by_gid,
             watched_task_gid=watched_task_gid,
-            watched_runtime_snapshot=runtime_snapshot,
-            aria2_online=True,
+            watched_runtime_snapshot=TaskRuntimeSnapshot(
+                connection_rows=connection_rows,
+                thread_count=thread_count,
+                thread_lines=thread_lines,
+                piece_map_snapshot=piece_map_snapshot,
+            ),
         )
 
     def _normalize_detached_tasks(
@@ -419,20 +525,23 @@ class DownloadManager(QObject):
 
     def _apply_sync_result(self, result: SyncResult) -> None:
         with self._state_lock:
-            self._cached_connection_rows_by_gid = {
-                gid: list(rows) for gid, rows in result.connection_rows_by_gid.items()
-            }
             active_gids = {task.gid for task in result.tasks if task.status_enum == TaskStatus.ACTIVE}
+            observed_gids = set(self._observed_connection_row_gids)
+            watched_task_gid = self._watched_task_gid
+            stale_connection_gids = [
+                gid
+                for gid in self._cached_connection_rows_by_gid
+                if gid not in active_gids or gid not in observed_gids
+            ]
+            for gid in stale_connection_gids:
+                self._cached_connection_rows_by_gid.pop(gid, None)
             stale_runtime_gids = [
-                gid for gid in self._runtime_snapshot_by_gid if gid not in active_gids and gid != result.watched_task_gid
+                gid
+                for gid in self._runtime_snapshot_by_gid
+                if gid not in active_gids and gid != watched_task_gid
             ]
             for gid in stale_runtime_gids:
                 self._runtime_snapshot_by_gid.pop(gid, None)
-            if result.watched_task_gid:
-                if result.watched_runtime_snapshot is None:
-                    self._runtime_snapshot_by_gid.pop(result.watched_task_gid, None)
-                else:
-                    self._runtime_snapshot_by_gid[result.watched_task_gid] = result.watched_runtime_snapshot
             self._suppressed_deleted_gids.intersection_update({task.gid for task in result.tasks})
 
         if result.aria2_online is not None:
@@ -442,9 +551,28 @@ class DownloadManager(QObject):
 
         tasks = [self._clone_task(task) for task in result.tasks]
         for task in tasks:
-            self._apply_ui_override(task)
+            self._apply_ui_override(task, reported_status=task.status)
 
         self.tasks_updated.emit(tasks)
+        self.sync_runtime_details(force=True)
+
+    def _apply_runtime_detail_result(self, result: RuntimeDetailResult) -> None:
+        with self._state_lock:
+            self._cached_connection_rows_by_gid = {
+                gid: list(rows) for gid, rows in result.connection_rows_by_gid.items()
+            }
+            if result.watched_task_gid:
+                if result.watched_runtime_snapshot is None:
+                    self._runtime_snapshot_by_gid.pop(result.watched_task_gid, None)
+                else:
+                    self._runtime_snapshot_by_gid[result.watched_task_gid] = (
+                        result.watched_runtime_snapshot
+                    )
+
+        if result.task_error_message:
+            self.task_error.emit(result.task_error_message)
+
+        self.runtime_details_updated.emit()
         if result.watched_task_gid and result.watched_runtime_snapshot is not None:
             self.task_runtime_snapshot_updated.emit(
                 result.watched_task_gid,
@@ -473,7 +601,28 @@ class DownloadManager(QObject):
         if task is None:
             return
         if changed:
-            self.sync_tasks()
+            self.sync_runtime_details(force=True)
+
+    def set_observed_connection_row_tasks(
+        self,
+        tasks: list[DownloadTask],
+        *,
+        default_slot_count: int = 16,
+    ) -> None:
+        next_gids = {task.gid for task in tasks if task is not None}
+        next_slot_count = max(int(default_slot_count or 1), 1)
+        with self._state_lock:
+            removed_gids = self._observed_connection_row_gids.difference(next_gids)
+            changed = (
+                self._observed_connection_row_gids != next_gids
+                or self._watched_task_default_slot_count != next_slot_count
+            )
+            self._observed_connection_row_gids = next_gids
+            self._watched_task_default_slot_count = next_slot_count
+            for gid in removed_gids:
+                self._cached_connection_rows_by_gid.pop(gid, None)
+        if changed and next_gids:
+            self.sync_runtime_details(force=True)
 
     def get_cached_task_connection_rows(self, task: DownloadTask) -> list[TaskConnectionRow]:
         with self._state_lock:
@@ -788,7 +937,7 @@ class DownloadManager(QObject):
     def _emit_persisted_tasks(self) -> None:
         tasks = [self._clone_task(task) for task in self.sort_tasks(self.repository.list_all())]
         for task in tasks:
-            self._apply_ui_override(task)
+            self._apply_ui_override(task, reported_status=task.status)
         self.tasks_updated.emit(tasks)
 
     def _set_aria2_state(self, online: bool, message: str = "") -> None:

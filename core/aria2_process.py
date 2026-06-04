@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import socket
 import subprocess
 import time
@@ -43,6 +44,7 @@ class Aria2ProcessManager:
             "--rpc-listen-all=false",
             f"--rpc-listen-port={self.config.rpc_port}",
             f"--rpc-secret={self.config.rpc_secret}",
+            f"--stop-with-process={os.getpid()}",
             "--continue=true",
             f"--input-file={session_path}",
             f"--save-session={session_path}",

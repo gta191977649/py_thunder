@@ -257,6 +257,9 @@ class MainWindow(QMainWindow):
         self._install_console_capture()
 
         self.download_manager.tasks_updated.connect(self.on_tasks_updated)
+        self.download_manager.runtime_details_updated.connect(
+            self._on_runtime_details_updated
+        )
         self.download_manager.task_runtime_snapshot_updated.connect(
             self._on_task_runtime_snapshot_updated
         )
@@ -499,6 +502,9 @@ class MainWindow(QMainWindow):
             self._show_task_context_menu
         )
         self.task_table.doubleClicked.connect(self._toggle_task_from_table_index)
+        self.task_table.expansion_changed.connect(
+            self._on_task_table_expansion_changed
+        )
         self.task_table.selectionModel().selectionChanged.connect(
             self._on_table_selection_changed
         )
@@ -1302,15 +1308,35 @@ class MainWindow(QMainWindow):
         if task:
             self._update_piece_map_for_task(task)
 
+    def _on_task_table_expansion_changed(self) -> None:
+        self._sync_selected_task_runtime_watch()
+
     def _sync_selected_task_runtime_watch(self) -> None:
         task = self._selected_task()
+        observed_tasks: list[DownloadTask] = []
+        tasks_by_gid = {download_task.gid: download_task for download_task in self.all_tasks}
+        for gid in self.task_model.expanded_gids():
+            observed_task = tasks_by_gid.get(gid)
+            if observed_task is not None:
+                observed_tasks.append(observed_task)
+
+        default_slot_count = max(int(self.config.max_connection_per_server or 1), 1)
+        if task is not None and task.gid not in {item.gid for item in observed_tasks}:
+            observed_tasks.append(task)
+        self.download_manager.set_observed_connection_row_tasks(
+            observed_tasks,
+            default_slot_count=default_slot_count,
+        )
         if task is None:
             self.download_manager.watch_task_runtime(None)
             return
         self.download_manager.watch_task_runtime(
             task,
-            default_slot_count=max(int(self.config.max_connection_per_server or 1), 1),
+            default_slot_count=default_slot_count,
         )
+
+    def _on_runtime_details_updated(self) -> None:
+        self._refresh_task_view()
 
     def _on_task_runtime_snapshot_updated(
         self,
@@ -1320,7 +1346,6 @@ class MainWindow(QMainWindow):
         current_task = self._selected_task()
         if current_task is None or current_task.gid != gid:
             return
-        self._refresh_task_view()
         self._update_runtime_views(current_task)
 
     def _toggle_task_from_table_index(self, index) -> None:
