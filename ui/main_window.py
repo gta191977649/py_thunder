@@ -34,6 +34,7 @@ from PyQt6.QtWidgets import (
     QPlainTextEdit,
     QProxyStyle,
     QScrollArea,
+    QSizePolicy,
     QSplitter,
     QStatusBar,
     QStyle,
@@ -513,6 +514,11 @@ class MainWindow(QMainWindow):
         self.task_info_label.setObjectName("taskInfoBody")
         self.task_info_label.setFont(self.ui_font)
         self.task_info_label.setWordWrap(True)
+        self.task_info_label.setMinimumWidth(0)
+        self.task_info_label.setSizePolicy(
+            QSizePolicy.Policy.Ignored,
+            QSizePolicy.Policy.Preferred,
+        )
         self.task_info_label.setAlignment(
             Qt.AlignmentFlag.AlignTop | Qt.AlignmentFlag.AlignLeft
         )

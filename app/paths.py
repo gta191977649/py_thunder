@@ -79,6 +79,10 @@ def get_database_path() -> Path:
     return get_app_data_dir() / "app.db"
 
 
+def get_single_instance_lock_path() -> Path:
+    return get_app_data_dir() / "app.lock"
+
+
 def get_aria2_session_path() -> Path:
     return get_app_data_dir() / "aria2.session"
 

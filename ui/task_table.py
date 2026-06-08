@@ -19,6 +19,7 @@ from PyQt6.QtGui import QColor, QIcon, QKeySequence, QLinearGradient, QPainter, 
 from PyQt6.QtWidgets import (
     QFileIconProvider,
     QHeaderView,
+    QAbstractItemView,
     QStyle,
     QStyledItemDelegate,
     QStyleOptionViewItem,
@@ -813,6 +814,8 @@ class TaskTableView(QTableView):
         self.setSortingEnabled(False)
         self.setAlternatingRowColors(False)
         self.setShowGrid(True)
+        self.setVerticalScrollMode(QAbstractItemView.ScrollMode.ScrollPerPixel)
+        self.setHorizontalScrollMode(QAbstractItemView.ScrollMode.ScrollPerPixel)
         self.setWordWrap(False)
         self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
         self.setAutoScroll(True)
@@ -849,6 +852,8 @@ class TaskTableView(QTableView):
         self.setColumnWidth(4, int(metrics.get("column_size_width", 108)))
         self.setColumnWidth(5, int(metrics.get("column_eta_width", 120)))
         self.setColumnWidth(6, int(metrics.get("column_file_type_width", 120)))
+        self.verticalScrollBar().setSingleStep(max(8, self.verticalHeader().defaultSectionSize() // 3))
+        self.horizontalScrollBar().setSingleStep(24)
 
     def apply_default_sort_for_completed_view(self, enabled: bool) -> None:
         column = 5
