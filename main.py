@@ -17,20 +17,35 @@ from storage.task_repository import TaskRepository
 from ui.main_window import MainWindow
 
 
+def _load_application_font_family() -> str:
+    font_dir = get_project_root() / "resources" / "font"
+    font_candidates = [
+        (font_dir / "default.ttf", None),
+        (font_dir / "simsun.ttc", "SimSun"),
+    ]
+
+    for font_path, preferred_family in font_candidates:
+        if not font_path.exists():
+            continue
+
+        font_id = QFontDatabase.addApplicationFont(str(font_path))
+        if font_id == -1:
+            continue
+
+        font_families = QFontDatabase.applicationFontFamilies(font_id)
+        if not font_families:
+            continue
+
+        if preferred_family and preferred_family in font_families:
+            return preferred_family
+        return font_families[0]
+
+    searched_paths = ", ".join(str(path) for path, _ in font_candidates)
+    raise FileNotFoundError(f"Required font file was not found or could not be loaded: {searched_paths}")
+
+
 def configure_app_font(app: QApplication, base_font_size: int = 9) -> None:
-    font_path = get_project_root() / "resources" / "font" / "default.ttf"
-    if not font_path.exists():
-        raise FileNotFoundError(f"Required font file was not found: {font_path}")
-
-    font_id = QFontDatabase.addApplicationFont(str(font_path))
-    if font_id == -1:
-        raise RuntimeError(f"Failed to load required font file: {font_path}")
-
-    font_families = QFontDatabase.applicationFontFamilies(font_id)
-    if not font_families:
-        raise RuntimeError(f"No font family was registered from: {font_path}")
-
-    font = QFont(font_families[0], base_font_size)
+    font = QFont(_load_application_font_family(), base_font_size)
     font.setStyleStrategy(QFont.StyleStrategy.PreferAntialias)
     app.setFont(font)
 
